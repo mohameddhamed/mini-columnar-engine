@@ -1,0 +1,30 @@
+[package]
+name = "mini-columnar-engine"
+version = "0.1.0"
+edition = "2021"
+authors = ["Mohamed Hamed <mohamedus.1970.hm@gmail.com>"]
+description = "Vectorized In-Memory OLAP Columnar Engine in Rust (SAP HANA / Celonis PQL architecture)"
+
+[dependencies]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "scan_aggregations"
+harness = false
+
+[[bin]]
+name = "mini-columnar-engine"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
