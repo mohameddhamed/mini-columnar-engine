@@ -4,7 +4,7 @@ use std::time::Instant;
 use mini_columnar_engine::column::dictionary::DictionaryColumn;
 use mini_columnar_engine::column::numeric::{Float64Column, Int64Column};
 use mini_columnar_engine::column::rle::RleColumn;
-use mini_columnar_engine::execution::filter::{scan_filter_i64_with_selection, ComparisonOp};
+use mini_columnar_engine::execution::filter::ComparisonOp;
 use mini_columnar_engine::table::{AnyColumn, ColumnTable};
 use mini_columnar_engine::AggregateOp;
 
@@ -128,18 +128,14 @@ fn main() {
         "─── [QUERY 1] Compound Predicate Filter: (region == 'EMEA' AND duration_ms > 5000) ───"
     );
 
-    // Columnar Vectorized Execution
+    // Columnar Vectorized Execution via Chained Filter Pushdown Pipeline
     let start_col = Instant::now();
     let sel_region = table
         .filter_dict("region", ComparisonOp::Equal, "EMEA")
         .unwrap();
-    let duration_col_ref = table.get_int64_column("duration_ms").unwrap();
-    let sel_final = scan_filter_i64_with_selection(
-        duration_col_ref,
-        &sel_region,
-        ComparisonOp::GreaterThan,
-        5000,
-    );
+    let sel_final = table
+        .filter_i64_with_sel("duration_ms", ComparisonOp::GreaterThan, 5000, &sel_region)
+        .unwrap();
     let dur_col = start_col.elapsed();
 
     // Row-Oriented Baseline Execution

@@ -428,3 +428,260 @@ fn test_column_table_mismatched_row_counts_error() {
     let err = table.add_column(AnyColumn::Int64(col2));
     assert!(err.is_err());
 }
+
+#[test]
+fn test_aggregations_with_nulls_and_selection_vector() {
+    let col_i = Int64Column::from_optional_iter("v_null", vec![Some(100), None, Some(200)]);
+    let sel = SelectionVector::from_indices(vec![0, 1, 2]);
+
+    assert_eq!(sum_i64(&col_i, Some(&sel)), 300);
+    assert_eq!(avg_i64(&col_i, Some(&sel)), Some(150.0));
+    assert_eq!(min_i64(&col_i, Some(&sel)), Some(100));
+    assert_eq!(max_i64(&col_i, Some(&sel)), Some(200));
+
+    // Negative numbers with null
+    let col_neg = Int64Column::from_optional_iter("v_neg", vec![Some(-100), None, Some(-200)]);
+    assert_eq!(max_i64(&col_neg, Some(&sel)), Some(-100));
+
+    // All nulls
+    let col_all_null = Int64Column::from_optional_iter("v_all_null", vec![None, None]);
+    let sel_all = SelectionVector::from_indices(vec![0, 1]);
+    assert_eq!(min_i64(&col_all_null, Some(&sel_all)), None);
+    assert_eq!(max_i64(&col_all_null, Some(&sel_all)), None);
+    assert_eq!(avg_i64(&col_all_null, Some(&sel_all)), None);
+
+    // Float64
+    let col_f = Float64Column::from_optional_iter("f_null", vec![Some(10.5), None, Some(20.5)]);
+    assert_eq!(min_f64(&col_f, Some(&sel)), Some(10.5));
+    assert_eq!(max_f64(&col_f, Some(&sel)), Some(20.5));
+    assert_eq!(avg_f64(&col_f, Some(&sel)), Some(15.5));
+}
+
+#[test]
+fn test_group_by_with_null_groups_and_null_values() {
+    let mut dict_col = DictionaryColumn::new("status");
+    dict_col.push_null(); // Row 0 is null
+    dict_col.push("APPROVED"); // Row 1 is APPROVED (key 0)
+    dict_col.push("APPROVED"); // Row 2 is APPROVED
+
+    let val_col = Int64Column::from_slice("amt", &[999, 10, 20]);
+    let direct_results = group_by_dict_sum_i64(&dict_col, &val_col, None);
+    let map: std::collections::HashMap<String, i64> = direct_results.into_iter().collect();
+
+    // APPROVED sum must NOT include row 0 (999) which was NULL!
+    assert_eq!(map.get("APPROVED"), Some(&30));
+
+    let count_res = group_by_dict_count(&dict_col, None);
+    let count_map: std::collections::HashMap<String, usize> = count_res.into_iter().collect();
+    // APPROVED count must be 2, NOT 3!
+    assert_eq!(count_map.get("APPROVED"), Some(&2));
+}
+
+#[test]
+fn test_count_aggregation_with_nulls() {
+    let mut table = ColumnTable::new("null_test");
+    let col_i = Int64Column::from_optional_iter("nullable_int", vec![Some(1), None, Some(3)]);
+    table.add_column(AnyColumn::Int64(col_i)).unwrap();
+
+    let count_val = table
+        .aggregate("nullable_int", AggregateOp::Count, None)
+        .unwrap();
+    // Non-null count must be 2, not 3!
+    assert_eq!(count_val, AggregateValue::Count(2));
+
+    let sel = SelectionVector::from_indices(vec![0, 1]); // row 0: valid, row 1: null
+    let count_sel = table
+        .aggregate("nullable_int", AggregateOp::Count, Some(&sel))
+        .unwrap();
+    assert_eq!(count_sel, AggregateValue::Count(1));
+}
+
+#[test]
+fn test_selection_vector_bitmap_conversions_and_not() {
+    let sv = SelectionVector::from_indices(vec![1, 3, 5]);
+    let bm = sv.to_bitmap(7);
+
+    assert_eq!(bm.len(), 7);
+    assert!(!bm.is_valid(0));
+    assert!(bm.is_valid(1));
+    assert!(!bm.is_valid(2));
+    assert!(bm.is_valid(3));
+    assert!(!bm.is_valid(4));
+    assert!(bm.is_valid(5));
+    assert!(!bm.is_valid(6));
+
+    let sv_roundtrip = SelectionVector::from_bitmap(&bm);
+    assert_eq!(sv_roundtrip.as_slice(), &[1, 3, 5]);
+
+    let sv_not = sv.not(7);
+    assert_eq!(sv_not.as_slice(), &[0, 2, 4, 6]);
+}
+
+#[test]
+fn test_null_bitmap_bit_not_and_to_indices() {
+    let bm = NullBitmap::from_bools(&[true, false, true, false, true]);
+    let not_bm = bm.bit_not();
+
+    assert_eq!(
+        (0..5).map(|i| not_bm.is_valid(i)).collect::<Vec<_>>(),
+        vec![false, true, false, true, false]
+    );
+
+    let indices = bm.to_indices();
+    assert_eq!(indices, vec![0, 2, 4]);
+}
+
+#[test]
+fn test_rle_aggregations_and_table_pipeline() {
+    let mut rle = RleColumn::new("runs");
+    for _ in 0..100 {
+        rle.push(10i64);
+    }
+    for _ in 0..50 {
+        rle.push(30i64);
+    }
+    for _ in 0..50 {
+        rle.push(20i64);
+    }
+
+    assert_eq!(rle.sum(), 3500); // 100*10 + 50*30 + 50*20 = 1000 + 1500 + 1000 = 3500
+    assert_eq!(rle.min(), Some(10));
+    assert_eq!(rle.max(), Some(30));
+    assert_eq!(rle.avg(), Some(17.5)); // 3500 / 200 = 17.5
+
+    let mut table = ColumnTable::new("rle_table");
+    table.add_column(AnyColumn::RleInt64(rle)).unwrap();
+
+    assert_eq!(
+        table.aggregate("runs", AggregateOp::Sum, None).unwrap(),
+        AggregateValue::Int(3500)
+    );
+    assert_eq!(
+        table.aggregate("runs", AggregateOp::Min, None).unwrap(),
+        AggregateValue::Int(10)
+    );
+    assert_eq!(
+        table.aggregate("runs", AggregateOp::Max, None).unwrap(),
+        AggregateValue::Int(30)
+    );
+    assert_eq!(
+        table.aggregate("runs", AggregateOp::Avg, None).unwrap(),
+        AggregateValue::Float(17.5)
+    );
+}
+
+#[test]
+fn test_group_by_avg_min_max() {
+    let mut table = ColumnTable::new("sales");
+    let region = DictionaryColumn::from_iter("region", ["EMEA", "APAC", "EMEA", "APAC", "EMEA"]);
+    let revenue_i = Int64Column::from_slice("rev_i", &[100, 200, 300, 400, 500]);
+    let revenue_f = Float64Column::from_slice("rev_f", &[10.0, 20.0, 30.0, 40.0, 50.0]);
+
+    table.add_column(AnyColumn::Dictionary(region)).unwrap();
+    table.add_column(AnyColumn::Int64(revenue_i)).unwrap();
+    table.add_column(AnyColumn::Float64(revenue_f)).unwrap();
+
+    // Group by AVG (Int64): EMEA (100+300+500)/3 = 300.0, APAC (200+400)/2 = 300.0
+    let gb_avg_i = table
+        .group_by("region", "rev_i", AggregateOp::Avg, None)
+        .unwrap();
+    let map_avg_i: std::collections::HashMap<_, _> = gb_avg_i.into_iter().collect();
+    assert_eq!(map_avg_i.get("EMEA"), Some(&AggregateValue::Float(300.0)));
+    assert_eq!(map_avg_i.get("APAC"), Some(&AggregateValue::Float(300.0)));
+
+    // Group by MIN (Int64)
+    let gb_min_i = table
+        .group_by("region", "rev_i", AggregateOp::Min, None)
+        .unwrap();
+    let map_min_i: std::collections::HashMap<_, _> = gb_min_i.into_iter().collect();
+    assert_eq!(map_min_i.get("EMEA"), Some(&AggregateValue::Int(100)));
+    assert_eq!(map_min_i.get("APAC"), Some(&AggregateValue::Int(200)));
+
+    // Group by MAX (Int64)
+    let gb_max_i = table
+        .group_by("region", "rev_i", AggregateOp::Max, None)
+        .unwrap();
+    let map_max_i: std::collections::HashMap<_, _> = gb_max_i.into_iter().collect();
+    assert_eq!(map_max_i.get("EMEA"), Some(&AggregateValue::Int(500)));
+    assert_eq!(map_max_i.get("APAC"), Some(&AggregateValue::Int(400)));
+
+    // Group by MIN (Float64)
+    let gb_min_f = table
+        .group_by("region", "rev_f", AggregateOp::Min, None)
+        .unwrap();
+    let map_min_f: std::collections::HashMap<_, _> = gb_min_f.into_iter().collect();
+    assert_eq!(map_min_f.get("EMEA"), Some(&AggregateValue::Float(10.0)));
+    assert_eq!(map_min_f.get("APAC"), Some(&AggregateValue::Float(20.0)));
+
+    // Group by MAX (Float64)
+    let gb_max_f = table
+        .group_by("region", "rev_f", AggregateOp::Max, None)
+        .unwrap();
+    let map_max_f: std::collections::HashMap<_, _> = gb_max_f.into_iter().collect();
+    assert_eq!(map_max_f.get("EMEA"), Some(&AggregateValue::Float(50.0)));
+    assert_eq!(map_max_f.get("APAC"), Some(&AggregateValue::Float(40.0)));
+}
+
+#[test]
+fn test_compound_filter_f64_and_dict() {
+    let mut table = ColumnTable::new("events");
+    let act =
+        DictionaryColumn::from_iter("act", ["Create", "Approve", "Create", "Approve", "Reject"]);
+    let cost = Float64Column::from_slice("cost", &[10.0, 50.0, 15.0, 80.0, 5.0]);
+
+    table.add_column(AnyColumn::Dictionary(act)).unwrap();
+    table.add_column(AnyColumn::Float64(cost)).unwrap();
+
+    // 1. Filter act == "Approve" -> indices [1, 3]
+    let sel_act = table
+        .filter_dict("act", ComparisonOp::Equal, "Approve")
+        .unwrap();
+    assert_eq!(sel_act.as_slice(), &[1, 3]);
+
+    // 2. Chained filter cost > 60.0 on sel_act -> index [3]
+    let sel_cost = table
+        .filter_f64_with_sel("cost", ComparisonOp::GreaterThan, 60.0, &sel_act)
+        .unwrap();
+    assert_eq!(sel_cost.as_slice(), &[3]);
+
+    // 3. Chained filter act != "Reject" on sel_cost -> index [3]
+    let sel_dict_compound = table
+        .filter_dict_with_sel("act", ComparisonOp::NotEqual, "Reject", &sel_cost)
+        .unwrap();
+    assert_eq!(sel_dict_compound.as_slice(), &[3]);
+}
+
+#[test]
+fn test_chunked_vector_processing() {
+    let vals: Vec<i64> = (0..2500).map(|i| i as i64).collect();
+    let col = Int64Column::from_slice("chunk_col", &vals);
+
+    let chunks: Vec<_> = mini_columnar_engine::vector_chunks(col.len(), 1024).collect();
+    assert_eq!(chunks.len(), 3);
+    assert_eq!(chunks[0].num_rows, 1024);
+    assert_eq!(chunks[1].num_rows, 1024);
+    assert_eq!(chunks[2].num_rows, 452); // 2500 - 2048 = 452
+
+    let mut total_matches = 0;
+    for chunk in &chunks {
+        let sel = mini_columnar_engine::scan_chunk_filter_i64(
+            &col,
+            chunk,
+            ComparisonOp::GreaterThanOrEqual,
+            2000,
+        );
+        total_matches += sel.len();
+    }
+    assert_eq!(total_matches, 500); // 2000..2500
+}
+
+#[test]
+fn test_dictionary_range_filtering() {
+    let col = DictionaryColumn::from_iter("code", ["B", "D", "A", "C", "E"]);
+
+    let sel_gt = mini_columnar_engine::scan_filter_dict(&col, ComparisonOp::GreaterThan, "B");
+    assert_eq!(sel_gt.as_slice(), &[1, 3, 4]); // D, C, E
+
+    let sel_lte = mini_columnar_engine::scan_filter_dict(&col, ComparisonOp::LessThanOrEqual, "B");
+    assert_eq!(sel_lte.as_slice(), &[0, 2]); // B, A
+}

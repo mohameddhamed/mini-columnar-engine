@@ -2,6 +2,9 @@ use super::bitmap::NullBitmap;
 use super::{Column, ColumnType};
 use std::collections::HashMap;
 
+/// Sentinel surrogate key used for NULL entries (SAP HANA convention).
+pub const NULL_SURROGATE: u32 = u32::MAX;
+
 /// Dictionary-encoded column for low-to-medium cardinality string data.
 ///
 /// This implements the signature compression and query acceleration architecture of
@@ -118,8 +121,8 @@ impl DictionaryColumn {
         } else if let Some(ref mut bm) = self.null_bitmap {
             bm.append_null();
         }
-        // Use 0 as dummy surrogate ID for null rows
-        self.keys.push(0);
+        // Use sentinel surrogate ID for null rows (prevents accidental index into group 0)
+        self.keys.push(NULL_SURROGATE);
     }
 
     /// Look up the surrogate ID for a given string token in O(1) time.
@@ -131,7 +134,11 @@ impl DictionaryColumn {
     /// Resolve a surrogate ID back to its string representation.
     #[inline(always)]
     pub fn resolve(&self, id: u32) -> Option<&str> {
-        self.dictionary.get(id as usize).map(|s| s.as_str())
+        if id == NULL_SURROGATE {
+            None
+        } else {
+            self.dictionary.get(id as usize).map(|s| s.as_str())
+        }
     }
 
     /// Get the string value at row `idx`, returning `None` if null or out of bounds.
@@ -146,6 +153,9 @@ impl DictionaryColumn {
             }
         }
         let id = self.keys[idx];
+        if id == NULL_SURROGATE {
+            return None;
+        }
         self.resolve(id)
     }
 

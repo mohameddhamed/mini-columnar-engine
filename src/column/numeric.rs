@@ -141,6 +141,18 @@ impl Int64Column {
             .unwrap_or(false)
     }
 
+    /// Number of rows stored in the column.
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// True if the column contains zero rows.
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     /// Yield contiguous chunks of `chunk_size` elements for vectorized iteration.
     #[inline(always)]
     pub fn chunks(&self, chunk_size: usize) -> std::slice::Chunks<'_, i64> {
@@ -309,6 +321,18 @@ impl Float64Column {
             .as_ref()
             .map(|bm| bm.null_count() > 0)
             .unwrap_or(false)
+    }
+
+    /// Number of rows stored in the column.
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// True if the column contains zero rows.
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
 
     #[inline(always)]

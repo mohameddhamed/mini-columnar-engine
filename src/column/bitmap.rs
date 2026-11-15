@@ -164,6 +164,38 @@ impl NullBitmap {
         }
     }
 
+    /// Fast bitwise NOT (inversion) with proper excess bit masking.
+    pub fn bit_not(&self) -> Self {
+        let mut words: Vec<u64> = self.words.iter().map(|&w| !w).collect();
+        let num_words = self.words.len();
+        let remainder = self.len % 64;
+        if remainder > 0 && num_words > 0 {
+            words[num_words - 1] &= (1u64 << remainder) - 1;
+        }
+        Self {
+            words,
+            len: self.len,
+        }
+    }
+
+    /// Extract all valid (set) bit row indices using fast bit-manipulation (`trailing_zeros`).
+    pub fn to_indices(&self) -> Vec<usize> {
+        let mut indices = Vec::with_capacity(self.len - self.null_count());
+        for (w_idx, &word) in self.words.iter().enumerate() {
+            let mut w = word;
+            let base = w_idx * 64;
+            while w != 0 {
+                let bit = w.trailing_zeros() as usize;
+                let idx = base + bit;
+                if idx < self.len {
+                    indices.push(idx);
+                }
+                w &= w - 1; // Clear lowest set bit
+            }
+        }
+        indices
+    }
+
     /// Access raw 64-bit words for SIMD/bit-parallel scan processing.
     #[inline(always)]
     pub fn words(&self) -> &[u64] {

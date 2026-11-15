@@ -107,6 +107,25 @@ impl RleColumn<i64> {
         }
         total
     }
+
+    /// O(runs) MIN over RLE-compressed i64 data.
+    pub fn min(&self) -> Option<i64> {
+        self.values.iter().copied().min()
+    }
+
+    /// O(runs) MAX over RLE-compressed i64 data.
+    pub fn max(&self) -> Option<i64> {
+        self.values.iter().copied().max()
+    }
+
+    /// O(runs) AVG over RLE-compressed i64 data.
+    pub fn avg(&self) -> Option<f64> {
+        if self.total_len == 0 {
+            None
+        } else {
+            Some(self.sum() as f64 / self.total_len as f64)
+        }
+    }
 }
 
 impl Column for RleColumn<i64> {

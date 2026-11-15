@@ -6,11 +6,15 @@ use crate::column::rle::RleColumn;
 use crate::column::string::StringColumn;
 use crate::column::{Column, ColumnType};
 use crate::execution::aggregate::{
-    avg_f64, avg_i64, group_by_dict_count, group_by_dict_sum_f64, group_by_dict_sum_i64, max_f64,
-    max_i64, min_f64, min_i64, sum_f64, sum_i64, AggregateOp, AggregateValue,
+    avg_f64, avg_i64, count_dict, count_f64, count_i64, count_string, group_by_dict_avg_f64,
+    group_by_dict_avg_i64, group_by_dict_count, group_by_dict_max_f64, group_by_dict_max_i64,
+    group_by_dict_min_f64, group_by_dict_min_i64, group_by_dict_sum_f64, group_by_dict_sum_i64,
+    max_f64, max_i64, min_f64, min_i64, sum_f64, sum_i64, AggregateOp, AggregateValue,
 };
 use crate::execution::filter::{
-    scan_filter_dict, scan_filter_f64, scan_filter_i64, ComparisonOp, SelectionVector,
+    scan_filter_dict, scan_filter_dict_with_selection, scan_filter_f64,
+    scan_filter_f64_with_selection, scan_filter_i64, scan_filter_i64_with_selection, ComparisonOp,
+    SelectionVector,
 };
 
 /// Unified enum container representing any supported column storage type.
@@ -184,6 +188,20 @@ impl ColumnTable {
         Ok(scan_filter_i64(col, op, target))
     }
 
+    /// Execute a vectorized filter scan over an integer column with an existing selection vector.
+    pub fn filter_i64_with_sel(
+        &self,
+        col_name: &str,
+        op: ComparisonOp,
+        target: i64,
+        sel: &SelectionVector,
+    ) -> Result<SelectionVector, String> {
+        let col = self
+            .get_int64_column(col_name)
+            .ok_or_else(|| format!("Int64 column '{}' not found", col_name))?;
+        Ok(scan_filter_i64_with_selection(col, sel, op, target))
+    }
+
     /// Execute a vectorized filter scan over a float column.
     pub fn filter_f64(
         &self,
@@ -197,6 +215,20 @@ impl ColumnTable {
         Ok(scan_filter_f64(col, op, target))
     }
 
+    /// Execute a vectorized filter scan over a float column with an existing selection vector.
+    pub fn filter_f64_with_sel(
+        &self,
+        col_name: &str,
+        op: ComparisonOp,
+        target: f64,
+        sel: &SelectionVector,
+    ) -> Result<SelectionVector, String> {
+        let col = self
+            .get_float64_column(col_name)
+            .ok_or_else(|| format!("Float64 column '{}' not found", col_name))?;
+        Ok(scan_filter_f64_with_selection(col, sel, op, target))
+    }
+
     /// Execute a vectorized filter scan over a dictionary column.
     pub fn filter_dict(
         &self,
@@ -208,6 +240,20 @@ impl ColumnTable {
             .get_dict_column(col_name)
             .ok_or_else(|| format!("Dictionary column '{}' not found", col_name))?;
         Ok(scan_filter_dict(col, op, target))
+    }
+
+    /// Execute a vectorized filter scan over a dictionary column with an existing selection vector.
+    pub fn filter_dict_with_sel(
+        &self,
+        col_name: &str,
+        op: ComparisonOp,
+        target: &str,
+        sel: &SelectionVector,
+    ) -> Result<SelectionVector, String> {
+        let col = self
+            .get_dict_column(col_name)
+            .ok_or_else(|| format!("Dictionary column '{}' not found", col_name))?;
+        Ok(scan_filter_dict_with_selection(col, sel, op, target))
     }
 
     /// Execute an analytical aggregation over a numeric column, optionally filtered by `sel`.
@@ -236,10 +282,7 @@ impl ColumnTable {
                     Some(m) => Ok(AggregateValue::Int(m)),
                     None => Ok(AggregateValue::Null),
                 },
-                AggregateOp::Count => {
-                    let cnt = sel.map(|s| s.len()).unwrap_or_else(|| c.len());
-                    Ok(AggregateValue::Count(cnt))
-                }
+                AggregateOp::Count => Ok(AggregateValue::Count(count_i64(c, sel))),
             },
             AnyColumn::Float64(c) => match op {
                 AggregateOp::Sum => Ok(AggregateValue::Float(sum_f64(c, sel))),
@@ -255,31 +298,33 @@ impl ColumnTable {
                     Some(m) => Ok(AggregateValue::Float(m)),
                     None => Ok(AggregateValue::Null),
                 },
-                AggregateOp::Count => {
-                    let cnt = sel.map(|s| s.len()).unwrap_or_else(|| c.len());
-                    Ok(AggregateValue::Count(cnt))
-                }
+                AggregateOp::Count => Ok(AggregateValue::Count(count_f64(c, sel))),
             },
             AnyColumn::RleInt64(c) => match op {
                 AggregateOp::Sum => Ok(AggregateValue::Int(c.sum())),
                 AggregateOp::Count => Ok(AggregateValue::Count(c.len())),
-                _ => Err(format!("Unsupported aggregate {:?} on RleInt64 column", op)),
+                AggregateOp::Min => match c.min() {
+                    Some(m) => Ok(AggregateValue::Int(m)),
+                    None => Ok(AggregateValue::Null),
+                },
+                AggregateOp::Max => match c.max() {
+                    Some(m) => Ok(AggregateValue::Int(m)),
+                    None => Ok(AggregateValue::Null),
+                },
+                AggregateOp::Avg => match c.avg() {
+                    Some(a) => Ok(AggregateValue::Float(a)),
+                    None => Ok(AggregateValue::Null),
+                },
             },
             AnyColumn::Dictionary(c) => match op {
-                AggregateOp::Count => {
-                    let cnt = sel.map(|s| s.len()).unwrap_or_else(|| c.len());
-                    Ok(AggregateValue::Count(cnt))
-                }
+                AggregateOp::Count => Ok(AggregateValue::Count(count_dict(c, sel))),
                 _ => Err(format!(
                     "Cannot compute numeric aggregate {:?} on Dictionary column",
                     op
                 )),
             },
             AnyColumn::String(c) => match op {
-                AggregateOp::Count => {
-                    let cnt = sel.map(|s| s.len()).unwrap_or_else(|| c.len());
-                    Ok(AggregateValue::Count(cnt))
-                }
+                AggregateOp::Count => Ok(AggregateValue::Count(count_string(c, sel))),
                 _ => Err(format!(
                     "Cannot compute numeric aggregate {:?} on String column",
                     op
@@ -312,11 +357,101 @@ impl ColumnTable {
                     .map(|(k, v)| (k, AggregateValue::Int(v)))
                     .collect())
             }
+            (AnyColumn::Int64(ic), AggregateOp::Avg) => {
+                let results = group_by_dict_avg_i64(group_col, ic, sel);
+                Ok(results
+                    .into_iter()
+                    .map(|(k, v)| {
+                        (
+                            k,
+                            match v {
+                                Some(a) => AggregateValue::Float(a),
+                                None => AggregateValue::Null,
+                            },
+                        )
+                    })
+                    .collect())
+            }
+            (AnyColumn::Int64(ic), AggregateOp::Min) => {
+                let results = group_by_dict_min_i64(group_col, ic, sel);
+                Ok(results
+                    .into_iter()
+                    .map(|(k, v)| {
+                        (
+                            k,
+                            match v {
+                                Some(m) => AggregateValue::Int(m),
+                                None => AggregateValue::Null,
+                            },
+                        )
+                    })
+                    .collect())
+            }
+            (AnyColumn::Int64(ic), AggregateOp::Max) => {
+                let results = group_by_dict_max_i64(group_col, ic, sel);
+                Ok(results
+                    .into_iter()
+                    .map(|(k, v)| {
+                        (
+                            k,
+                            match v {
+                                Some(m) => AggregateValue::Int(m),
+                                None => AggregateValue::Null,
+                            },
+                        )
+                    })
+                    .collect())
+            }
             (AnyColumn::Float64(fc), AggregateOp::Sum) => {
                 let results = group_by_dict_sum_f64(group_col, fc, sel);
                 Ok(results
                     .into_iter()
                     .map(|(k, v)| (k, AggregateValue::Float(v)))
+                    .collect())
+            }
+            (AnyColumn::Float64(fc), AggregateOp::Avg) => {
+                let results = group_by_dict_avg_f64(group_col, fc, sel);
+                Ok(results
+                    .into_iter()
+                    .map(|(k, v)| {
+                        (
+                            k,
+                            match v {
+                                Some(a) => AggregateValue::Float(a),
+                                None => AggregateValue::Null,
+                            },
+                        )
+                    })
+                    .collect())
+            }
+            (AnyColumn::Float64(fc), AggregateOp::Min) => {
+                let results = group_by_dict_min_f64(group_col, fc, sel);
+                Ok(results
+                    .into_iter()
+                    .map(|(k, v)| {
+                        (
+                            k,
+                            match v {
+                                Some(m) => AggregateValue::Float(m),
+                                None => AggregateValue::Null,
+                            },
+                        )
+                    })
+                    .collect())
+            }
+            (AnyColumn::Float64(fc), AggregateOp::Max) => {
+                let results = group_by_dict_max_f64(group_col, fc, sel);
+                Ok(results
+                    .into_iter()
+                    .map(|(k, v)| {
+                        (
+                            k,
+                            match v {
+                                Some(m) => AggregateValue::Float(m),
+                                None => AggregateValue::Null,
+                            },
+                        )
+                    })
                     .collect())
             }
             (_, AggregateOp::Count) => {

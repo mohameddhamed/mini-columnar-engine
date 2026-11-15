@@ -145,6 +145,107 @@ impl SelectionVector {
 
         Self { indices: result }
     }
+
+    /// Convert selection vector into a bit-packed `NullBitmap`.
+    pub fn to_bitmap(&self, total_rows: usize) -> crate::column::bitmap::NullBitmap {
+        let mut bm = crate::column::bitmap::NullBitmap::new(total_rows, false);
+        for &idx in &self.indices {
+            if idx < total_rows {
+                bm.set_valid(idx);
+            }
+        }
+        bm
+    }
+
+    /// Construct a selection vector from a `NullBitmap` (1-bits become indices).
+    pub fn from_bitmap(bm: &crate::column::bitmap::NullBitmap) -> Self {
+        Self {
+            indices: bm.to_indices(),
+        }
+    }
+
+    /// Invert selection vector (NOT logic) relative to `total_rows`.
+    pub fn not(&self, total_rows: usize) -> Self {
+        let mut result = Vec::with_capacity(total_rows.saturating_sub(self.indices.len()));
+        let mut cur = 0;
+        let mut sel_idx = 0;
+        let sel = &self.indices;
+
+        while cur < total_rows {
+            if sel_idx < sel.len() && sel[sel_idx] == cur {
+                sel_idx += 1;
+            } else {
+                result.push(cur);
+            }
+            cur += 1;
+        }
+
+        Self { indices: result }
+    }
+}
+
+/// Vector Batch: fixed-size chunk of rows (default `VECTOR_CHUNK_SIZE = 1024`) processed together
+/// to ensure operands remain 100% resident in CPU L1 data cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorBatch {
+    pub start_row: usize,
+    pub num_rows: usize,
+}
+
+impl VectorBatch {
+    pub fn new(start_row: usize, num_rows: usize) -> Self {
+        Self {
+            start_row,
+            num_rows,
+        }
+    }
+
+    /// End row index (exclusive).
+    #[inline(always)]
+    pub fn end_row(&self) -> usize {
+        self.start_row + self.num_rows
+    }
+}
+
+/// Create an iterator over vector chunks (each of size `chunk_size`, e.g. `VECTOR_CHUNK_SIZE`).
+pub fn vector_chunks(total_rows: usize, chunk_size: usize) -> impl Iterator<Item = VectorBatch> {
+    let num_chunks = total_rows.div_ceil(chunk_size);
+    (0..num_chunks).map(move |i| {
+        let start = i * chunk_size;
+        let count = (total_rows - start).min(chunk_size);
+        VectorBatch::new(start, count)
+    })
+}
+
+/// Vectorized chunk-level filter evaluation on `Int64Column`.
+pub fn scan_chunk_filter_i64(
+    col: &Int64Column,
+    batch: &VectorBatch,
+    op: ComparisonOp,
+    target: i64,
+) -> SelectionVector {
+    let data = col.as_slice();
+    let start = batch.start_row;
+    let end = (start + batch.num_rows).min(data.len());
+    let mut matching = Vec::with_capacity(batch.num_rows / 4);
+
+    if let Some(bm) = col.null_bitmap() {
+        for (offset, &val) in data[start..end].iter().enumerate() {
+            let i = start + offset;
+            if bm.is_valid(i) && evaluate_i64(val, op, target) {
+                matching.push(i);
+            }
+        }
+    } else {
+        for (offset, &val) in data[start..end].iter().enumerate() {
+            let i = start + offset;
+            if evaluate_i64(val, op, target) {
+                matching.push(i);
+            }
+        }
+    }
+
+    SelectionVector::from_indices(matching)
 }
 
 /// Vectorized filter pushdown operator for signed 64-bit integer columns (`Int64Column`).
@@ -157,10 +258,49 @@ pub fn scan_filter_i64(col: &Int64Column, op: ComparisonOp, target: i64) -> Sele
     let mut matching_indices = Vec::with_capacity(total_rows / 4);
 
     if let Some(bm) = col.null_bitmap() {
-        // Scans with null bitmap check
-        for (i, &val) in data.iter().enumerate() {
-            if bm.is_valid(i) && evaluate_i64(val, op, target) {
-                matching_indices.push(i);
+        // Bit-parallel null skipping: skip 64-row null words in a single clock cycle
+        let words = bm.words();
+        for (w_idx, &word) in words.iter().enumerate() {
+            if word == 0 {
+                continue; // 64 consecutive NULL rows skipped instantaneously
+            }
+            let base = w_idx * 64;
+            let end = (base + 64).min(total_rows);
+            if word == u64::MAX && end == base + 64 {
+                // All 64 rows valid: 8-way unrolled scan without bitmap checks
+                for chunk_idx in 0..8 {
+                    let b = base + chunk_idx * 8;
+                    if evaluate_i64(data[b], op, target) {
+                        matching_indices.push(b);
+                    }
+                    if evaluate_i64(data[b + 1], op, target) {
+                        matching_indices.push(b + 1);
+                    }
+                    if evaluate_i64(data[b + 2], op, target) {
+                        matching_indices.push(b + 2);
+                    }
+                    if evaluate_i64(data[b + 3], op, target) {
+                        matching_indices.push(b + 3);
+                    }
+                    if evaluate_i64(data[b + 4], op, target) {
+                        matching_indices.push(b + 4);
+                    }
+                    if evaluate_i64(data[b + 5], op, target) {
+                        matching_indices.push(b + 5);
+                    }
+                    if evaluate_i64(data[b + 6], op, target) {
+                        matching_indices.push(b + 6);
+                    }
+                    if evaluate_i64(data[b + 7], op, target) {
+                        matching_indices.push(b + 7);
+                    }
+                }
+            } else {
+                for (bit_offset, &val) in data[base..end].iter().enumerate() {
+                    if (word & (1u64 << bit_offset)) != 0 && evaluate_i64(val, op, target) {
+                        matching_indices.push(base + bit_offset);
+                    }
+                }
             }
         }
     } else {
@@ -241,9 +381,47 @@ pub fn scan_filter_f64(col: &Float64Column, op: ComparisonOp, target: f64) -> Se
     let mut matching_indices = Vec::with_capacity(total_rows / 4);
 
     if let Some(bm) = col.null_bitmap() {
-        for (i, &val) in data.iter().enumerate() {
-            if bm.is_valid(i) && evaluate_f64(val, op, target) {
-                matching_indices.push(i);
+        let words = bm.words();
+        for (w_idx, &word) in words.iter().enumerate() {
+            if word == 0 {
+                continue;
+            }
+            let base = w_idx * 64;
+            let end = (base + 64).min(total_rows);
+            if word == u64::MAX && end == base + 64 {
+                for chunk_idx in 0..8 {
+                    let b = base + chunk_idx * 8;
+                    if evaluate_f64(data[b], op, target) {
+                        matching_indices.push(b);
+                    }
+                    if evaluate_f64(data[b + 1], op, target) {
+                        matching_indices.push(b + 1);
+                    }
+                    if evaluate_f64(data[b + 2], op, target) {
+                        matching_indices.push(b + 2);
+                    }
+                    if evaluate_f64(data[b + 3], op, target) {
+                        matching_indices.push(b + 3);
+                    }
+                    if evaluate_f64(data[b + 4], op, target) {
+                        matching_indices.push(b + 4);
+                    }
+                    if evaluate_f64(data[b + 5], op, target) {
+                        matching_indices.push(b + 5);
+                    }
+                    if evaluate_f64(data[b + 6], op, target) {
+                        matching_indices.push(b + 6);
+                    }
+                    if evaluate_f64(data[b + 7], op, target) {
+                        matching_indices.push(b + 7);
+                    }
+                }
+            } else {
+                for (bit_offset, &val) in data[base..end].iter().enumerate() {
+                    if (word & (1u64 << bit_offset)) != 0 && evaluate_f64(val, op, target) {
+                        matching_indices.push(base + bit_offset);
+                    }
+                }
             }
         }
     } else {
@@ -286,6 +464,33 @@ pub fn scan_filter_f64(col: &Float64Column, op: ComparisonOp, target: f64) -> Se
     }
 
     SelectionVector::from_indices(matching_indices)
+}
+
+/// Filter pushdown applied on an existing `SelectionVector` for `Float64Column`.
+pub fn scan_filter_f64_with_selection(
+    col: &Float64Column,
+    sel: &SelectionVector,
+    op: ComparisonOp,
+    target: f64,
+) -> SelectionVector {
+    let data = col.as_slice();
+    let mut filtered = Vec::with_capacity(sel.len());
+
+    if let Some(bm) = col.null_bitmap() {
+        for &idx in sel.as_slice() {
+            if bm.is_valid(idx) && evaluate_f64(data[idx], op, target) {
+                filtered.push(idx);
+            }
+        }
+    } else {
+        for &idx in sel.as_slice() {
+            if evaluate_f64(data[idx], op, target) {
+                filtered.push(idx);
+            }
+        }
+    }
+
+    SelectionVector::from_indices(filtered)
 }
 
 /// Vectorized filter pushdown on `DictionaryColumn`.
@@ -393,32 +598,31 @@ pub fn scan_filter_dict(col: &DictionaryColumn, op: ComparisonOp, target: &str) 
         _ => {
             // Lexicographical comparisons against string target
             let dict = col.dictionary();
-            let mut matching_dict_ids = std::collections::HashSet::new();
+            let mut matches = vec![false; dict.len()];
 
             for (id, val) in dict.iter().enumerate() {
-                let matches = match op {
+                matches[id] = match op {
                     ComparisonOp::GreaterThan => val.as_str() > target,
                     ComparisonOp::GreaterThanOrEqual => val.as_str() >= target,
                     ComparisonOp::LessThan => val.as_str() < target,
                     ComparisonOp::LessThanOrEqual => val.as_str() <= target,
                     _ => unreachable!(),
                 };
-                if matches {
-                    matching_dict_ids.insert(id as u32);
-                }
             }
 
             let keys = col.keys();
             let mut matching_indices = Vec::new();
             if let Some(bm) = col.null_bitmap() {
                 for (i, &key) in keys.iter().enumerate() {
-                    if bm.is_valid(i) && matching_dict_ids.contains(&key) {
+                    let k = key as usize;
+                    if bm.is_valid(i) && k < matches.len() && matches[k] {
                         matching_indices.push(i);
                     }
                 }
             } else {
                 for (i, &key) in keys.iter().enumerate() {
-                    if matching_dict_ids.contains(&key) {
+                    let k = key as usize;
+                    if k < matches.len() && matches[k] {
                         matching_indices.push(i);
                     }
                 }
@@ -427,6 +631,99 @@ pub fn scan_filter_dict(col: &DictionaryColumn, op: ComparisonOp, target: &str) 
             SelectionVector::from_indices(matching_indices)
         }
     }
+}
+
+/// Filter pushdown applied on an existing `SelectionVector` for `DictionaryColumn`.
+pub fn scan_filter_dict_with_selection(
+    col: &DictionaryColumn,
+    sel: &SelectionVector,
+    op: ComparisonOp,
+    target: &str,
+) -> SelectionVector {
+    let target_id_opt = col.lookup_id(target);
+    let keys = col.keys();
+    let bm_opt = col.null_bitmap();
+    let mut filtered = Vec::with_capacity(sel.len());
+
+    match op {
+        ComparisonOp::Equal => {
+            let target_id = match target_id_opt {
+                Some(id) => id,
+                None => return SelectionVector::empty(),
+            };
+            if let Some(bm) = bm_opt {
+                for &idx in sel.as_slice() {
+                    if bm.is_valid(idx) && keys[idx] == target_id {
+                        filtered.push(idx);
+                    }
+                }
+            } else {
+                for &idx in sel.as_slice() {
+                    if keys[idx] == target_id {
+                        filtered.push(idx);
+                    }
+                }
+            }
+        }
+        ComparisonOp::NotEqual => match target_id_opt {
+            None => {
+                if let Some(bm) = bm_opt {
+                    for &idx in sel.as_slice() {
+                        if bm.is_valid(idx) {
+                            filtered.push(idx);
+                        }
+                    }
+                } else {
+                    return sel.clone();
+                }
+            }
+            Some(target_id) => {
+                if let Some(bm) = bm_opt {
+                    for &idx in sel.as_slice() {
+                        if bm.is_valid(idx) && keys[idx] != target_id {
+                            filtered.push(idx);
+                        }
+                    }
+                } else {
+                    for &idx in sel.as_slice() {
+                        if keys[idx] != target_id {
+                            filtered.push(idx);
+                        }
+                    }
+                }
+            }
+        },
+        _ => {
+            let dict = col.dictionary();
+            let mut matches = vec![false; dict.len()];
+            for (id, val) in dict.iter().enumerate() {
+                matches[id] = match op {
+                    ComparisonOp::GreaterThan => val.as_str() > target,
+                    ComparisonOp::GreaterThanOrEqual => val.as_str() >= target,
+                    ComparisonOp::LessThan => val.as_str() < target,
+                    ComparisonOp::LessThanOrEqual => val.as_str() <= target,
+                    _ => unreachable!(),
+                };
+            }
+            if let Some(bm) = bm_opt {
+                for &idx in sel.as_slice() {
+                    let k = keys[idx] as usize;
+                    if bm.is_valid(idx) && k < matches.len() && matches[k] {
+                        filtered.push(idx);
+                    }
+                }
+            } else {
+                for &idx in sel.as_slice() {
+                    let k = keys[idx] as usize;
+                    if k < matches.len() && matches[k] {
+                        filtered.push(idx);
+                    }
+                }
+            }
+        }
+    }
+
+    SelectionVector::from_indices(filtered)
 }
 
 #[inline(always)]

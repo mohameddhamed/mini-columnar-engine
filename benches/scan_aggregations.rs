@@ -134,6 +134,23 @@ fn bench_scalar_vs_vectorized_filter(c: &mut Criterion) {
         });
     });
 
+    // Chunked Vectorized Processing (1024-element vector chunks)
+    group.bench_function(BenchmarkId::new("ChunkedVectorFilter_1024", N), |b| {
+        b.iter(|| {
+            let mut total_matches = 0usize;
+            for chunk in mini_columnar_engine::vector_chunks(col.len(), 1024) {
+                let sel = mini_columnar_engine::scan_chunk_filter_i64(
+                    black_box(&col),
+                    &chunk,
+                    ComparisonOp::GreaterThan,
+                    black_box(threshold),
+                );
+                total_matches += sel.len();
+            }
+            total_matches
+        });
+    });
+
     group.finish();
 }
 

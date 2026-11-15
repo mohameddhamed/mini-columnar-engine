@@ -79,43 +79,38 @@ Duration Buffer: [ D0 (8B) | D1 (8B) | D2 (8B) | D3 (8B) | D4 (8B) | D5 (8B) | D
 - **Bit-Packed Null Mask (`NullBitmap`):** Instead of storing `Option<i64>` (which expands memory from 8 bytes to 16 bytes per cell due to compiler alignment/discriminant padding), missing values are decoupled into a compact 1-bit-per-row bitmap:
   - 1 bit per row: `1` = Valid (Not Null), `0` = Null.
   - Reduces null metadata overhead to **0.125 bytes per row** (8x smaller than a boolean array and 64x smaller than tagged union padding).
-  - Enables bitwise logical operations (`bit_and`, `bit_or`) using 64-bit word operations.
+  - Enables bitwise logical operations (`bit_and`, `bit_or`, `bit_not`) using 64-bit word operations.
+  - **Bit-Parallel Null Skipping:** Vectorized scans inspect raw 64-bit words; entire 64-row null chunks (`word == 0`) are skipped in a single clock cycle, while fully valid words (`word == u64::MAX`) bypass null checks entirely for maximum loop unrolling throughput.
 
 ### Pillar 2: Lightweight Database Compression (Dictionary & RLE)
 
 - **Dictionary-Encoded Strings (`DictionaryColumn`):**
   - Unique string tokens are stored once in a contiguous dictionary pool (`Vec<String>`).
   - Column cells store compact 32-bit integer surrogate keys (`Vec<u32>`).
+  - **Defense-in-Depth Sentinel:** Null rows are assigned `NULL_SURROGATE = u32::MAX`, ensuring direct array aggregations never corrupt group 0 even before bitmap evaluation.
   - **Instant Predicate Evaluation:** A string filter (e.g. `region == "EMEA"`) resolves `"EMEA"` to its surrogate integer ID $k$ in $O(1)$ via dictionary lookup. If the token does not exist in the dictionary, the engine **prunes the entire scan instantly in $O(1)$**. If found, the engine executes a contiguous 32-bit integer comparison loop across `keys`, eliminating all string byte comparisons and pointer dereferences during query execution.
+  - **Direct Boolean Lookup for Range Comparisons:** Range filters (`>`, `<`, `>=`, `<=`) precompute a dense `Vec<bool>` indexed by surrogate ID, replacing runtime hash-table probes with single L1 array accesses.
 - **Run-Length Encoding (`RleColumn`):**
   - Consecutive repeated values are compressed into `(value, count)` runs.
-  - Enables algebraic aggregation: $\text{SUM} = \sum (\text{value}_i \times \text{count}_i)$ in $O(\text{runs})$ time rather than $O(\text{rows})$.
+  - Enables algebraic aggregation: $\text{SUM} = \sum (\text{value}_i \times \text{count}_i)$ in $O(\text{runs})$ time rather than $O(\text{rows})$, with $O(\text{runs})$ mathematical evaluations for `MIN`, `MAX`, and `AVG`.
 
 ### Pillar 3: Vectorized Execution & Predicate Pushdown
 
-- **Rejection of Volcano Iterator:** Rather than invoking virtual function `next()` per row, operators process fixed-size vector chunks (1024 elements) sized to reside entirely within CPU L1 data cache (32–64 KB).
+- **Chunked Vector Execution (`VectorBatch`):** Rather than invoking virtual function `next()` per row, operators process fixed-size vector chunks (1024 elements) sized to reside entirely within CPU L1 data cache (32–64 KB).
 - **Selection Vectors (`SelectionVector`):**
   - Filtering operators evaluate predicates and emit a compact array of matching row indices (`&[usize]`).
   - Downstream operators (compound filters, aggregators, project operators) consume this selection vector directly, **materializing zero intermediate rows or column copies**.
+  - **Bitmask & Inversion Interoperability:** Zero-overhead bidirectional conversion between index arrays and bit-packed null masks (`to_bitmap`, `from_bitmap`, `not`).
 - **Loop Unrolling:** Scans are unrolled 8-way to break data hazards, minimize loop control branches, and allow LLVM to generate hardware SIMD instructions (ARM64 NEON / x86_64 AVX2).
 
 ### Pillar 4: Analytical Aggregations & Direct-Indexed Group By
 
-- **Loop-Unrolled Aggregators:** Numerical aggregations (`SUM`, `AVG`, `MIN`, `MAX`, `COUNT`) employ 4 independent accumulator registers to saturate superscalar execution units:
-  ```rust
-  let mut acc0 = 0i64; let mut acc1 = 0i64;
-  let mut acc2 = 0i64; let mut acc3 = 0i64;
-  for chunk in data.chunks_exact(4) {
-      acc0 += chunk[0]; acc1 += chunk[1];
-      acc2 += chunk[2]; acc3 += chunk[3];
-  }
-  let sum = acc0 + acc1 + acc2 + acc3;
-  ```
+- **Loop-Unrolled Aggregators:** Numerical aggregations (`SUM`, `AVG`, `MIN`, `MAX`, `COUNT`) employ 4 independent accumulator registers to saturate superscalar execution units, with strict null propagation ensuring mathematical parity.
 - **Direct-Indexed Vectorized Group By:**
   - Grouping over dictionary-encoded columns leverages the fact that surrogate IDs form a dense range $[0, K-1]$, where $K$ is the dictionary cardinality.
   - Rather than maintaining an expensive `std::collections::HashMap` (which causes pointer chasing, hashing latency, and hash collision chains), the engine allocates a contiguous vector of accumulators `Vec<Accumulator>` of length $K$.
   - Group updates are direct array accesses: `accumulators[surrogate_id as usize] += value`.
-  - **Zero hashing, zero hash collision resolution, zero heap allocation, 100% L1 cache resident.**
+  - Supports `SUM`, `AVG`, `MIN`, `MAX`, and `COUNT` with zero hashing, zero hash collision resolution, zero heap allocation, and 100% L1 cache residency.
 
 ---
 
@@ -249,7 +244,7 @@ mini-columnar-engine/
 │   ├── table.rs                  # Schema container & multi-column TableStore
 │   └── main.rs                   # End-to-end OLAP pipeline demo vs Row baseline
 ├── tests/
-│   └── integration_tests.rs      # 16 comprehensive integration & edge-case tests
+│   └── integration_tests.rs      # 26 comprehensive integration & edge-case tests
 ├── .github/
 │   └── workflows/ci.yml          # GitHub Actions CI workflow (fmt, clippy, test, bench)
 └── README.md                     # Engineering whitepaper & benchmark report
