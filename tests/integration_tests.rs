@@ -176,7 +176,7 @@ fn test_rle_column_compression_and_algebraic_sum() {
 
     // O(runs) evaluation: (10,000 * 5) + (5,000 * 10) + (2,000 * 20) = 50,000 + 50,000 + 40,000 = 140,000
     let sum = rle.sum();
-    assert_eq!(sum, 140_000);
+    assert_eq!(sum, Some(140_000));
 
     // Random access binary search test
     assert_eq!(rle.get(0), Some(&5));
@@ -314,28 +314,28 @@ fn test_vectorized_scan_dictionary_pruning() {
 #[test]
 fn test_numeric_aggregations_i64_and_f64() {
     let col_i = Int64Column::from_slice("v", &[10, 20, 30, 40, 50]);
-    assert_eq!(sum_i64(&col_i, None), 150);
+    assert_eq!(sum_i64(&col_i, None), Some(150));
     assert_eq!(avg_i64(&col_i, None), Some(30.0));
     assert_eq!(min_i64(&col_i, None), Some(10));
     assert_eq!(max_i64(&col_i, None), Some(50));
 
     // With selection vector
     let sel = SelectionVector::from_indices(vec![1, 3]); // values 20 and 40
-    assert_eq!(sum_i64(&col_i, Some(&sel)), 60);
+    assert_eq!(sum_i64(&col_i, Some(&sel)), Some(60));
     assert_eq!(avg_i64(&col_i, Some(&sel)), Some(30.0));
     assert_eq!(min_i64(&col_i, Some(&sel)), Some(20));
     assert_eq!(max_i64(&col_i, Some(&sel)), Some(40));
 
     // Float64
     let col_f = Float64Column::from_slice("f", &[1.5, 2.5, 3.5]);
-    assert!((sum_f64(&col_f, None) - 7.5).abs() < 1e-6);
+    assert!((sum_f64(&col_f, None).unwrap() - 7.5).abs() < 1e-6);
     assert!((avg_f64(&col_f, None).unwrap() - 2.5).abs() < 1e-6);
     assert_eq!(min_f64(&col_f, None), Some(1.5));
     assert_eq!(max_f64(&col_f, None), Some(3.5));
 
-    // Empty col edge case
+    // Empty col edge case: SQL / PQL standard requires SUM to return None (NULL)
     let empty_i = Int64Column::new("e");
-    assert_eq!(sum_i64(&empty_i, None), 0);
+    assert_eq!(sum_i64(&empty_i, None), None);
     assert_eq!(avg_i64(&empty_i, None), None);
     assert_eq!(min_i64(&empty_i, None), None);
     assert_eq!(max_i64(&empty_i, None), None);
@@ -434,7 +434,7 @@ fn test_aggregations_with_nulls_and_selection_vector() {
     let col_i = Int64Column::from_optional_iter("v_null", vec![Some(100), None, Some(200)]);
     let sel = SelectionVector::from_indices(vec![0, 1, 2]);
 
-    assert_eq!(sum_i64(&col_i, Some(&sel)), 300);
+    assert_eq!(sum_i64(&col_i, Some(&sel)), Some(300));
     assert_eq!(avg_i64(&col_i, Some(&sel)), Some(150.0));
     assert_eq!(min_i64(&col_i, Some(&sel)), Some(100));
     assert_eq!(max_i64(&col_i, Some(&sel)), Some(200));
@@ -446,6 +446,7 @@ fn test_aggregations_with_nulls_and_selection_vector() {
     // All nulls
     let col_all_null = Int64Column::from_optional_iter("v_all_null", vec![None, None]);
     let sel_all = SelectionVector::from_indices(vec![0, 1]);
+    assert_eq!(sum_i64(&col_all_null, Some(&sel_all)), None);
     assert_eq!(min_i64(&col_all_null, Some(&sel_all)), None);
     assert_eq!(max_i64(&col_all_null, Some(&sel_all)), None);
     assert_eq!(avg_i64(&col_all_null, Some(&sel_all)), None);
@@ -544,7 +545,7 @@ fn test_rle_aggregations_and_table_pipeline() {
         rle.push(20i64);
     }
 
-    assert_eq!(rle.sum(), 3500); // 100*10 + 50*30 + 50*20 = 1000 + 1500 + 1000 = 3500
+    assert_eq!(rle.sum(), Some(3500)); // 100*10 + 50*30 + 50*20 = 1000 + 1500 + 1000 = 3500
     assert_eq!(rle.min(), Some(10));
     assert_eq!(rle.max(), Some(30));
     assert_eq!(rle.avg(), Some(17.5)); // 3500 / 200 = 17.5
@@ -684,4 +685,165 @@ fn test_dictionary_range_filtering() {
 
     let sel_lte = mini_columnar_engine::scan_filter_dict(&col, ComparisonOp::LessThanOrEqual, "B");
     assert_eq!(sel_lte.as_slice(), &[0, 2]); // B, A
+}
+
+#[test]
+fn test_group_by_filtered_does_not_emit_phantom_groups() {
+    let categories = vec!["A", "B", "C", "A", "B", "C"];
+    let amounts = vec![10i64, 20, 30, 40, 50, 60];
+
+    let dict_col = DictionaryColumn::from_iter("cat", &categories);
+    let val_col = Int64Column::from_slice("amt", &amounts);
+
+    // Filter to only rows where amount < 25 (rows 0: A=10, 1: B=20). Category C has NO matching rows!
+    let sel = SelectionVector::from_indices(vec![0, 1]);
+
+    let results = group_by_dict_sum_i64(&dict_col, &val_col, Some(&sel));
+    let map: std::collections::HashMap<String, i64> = results.into_iter().collect();
+
+    assert_eq!(
+        map.len(),
+        2,
+        "Phantom group 'C' must not be emitted when it has 0 rows in selection"
+    );
+    assert_eq!(map.get("A"), Some(&10));
+    assert_eq!(map.get("B"), Some(&20));
+    assert_eq!(map.get("C"), None);
+}
+
+#[test]
+fn test_group_by_count_excludes_null_values() {
+    let categories = vec!["A", "A", "A", "B", "B"];
+    let amounts = vec![Some(10i64), None, Some(30), None, None]; // A has 2 valid, B has 0 valid
+
+    let mut table = ColumnTable::new("t");
+    let dict_col = DictionaryColumn::from_iter("cat", &categories);
+    let val_col = Int64Column::from_optional_iter("amt", amounts);
+
+    table.add_column(AnyColumn::Dictionary(dict_col)).unwrap();
+    table.add_column(AnyColumn::Int64(val_col)).unwrap();
+
+    // 1. COUNT(amt) - must ignore NULL values in amt
+    let count_col_res = table
+        .group_by("cat", "amt", AggregateOp::Count, None)
+        .unwrap();
+    let map_col: std::collections::HashMap<String, usize> = count_col_res
+        .into_iter()
+        .map(|(k, v)| match v {
+            AggregateValue::Count(c) => (k, c),
+            _ => unreachable!(),
+        })
+        .collect();
+
+    assert_eq!(map_col.get("A"), Some(&2));
+    assert_eq!(
+        map_col.get("B"),
+        None,
+        "Category B has all nulls for amt so COUNT(amt) is 0 and group is pruned"
+    );
+
+    // 2. COUNT(*) - must count all rows for each group regardless of amt nulls
+    let count_star_res = table.group_by_count_star("cat", None).unwrap();
+    let map_star: std::collections::HashMap<String, usize> = count_star_res.into_iter().collect();
+
+    assert_eq!(map_star.get("A"), Some(&3));
+    assert_eq!(map_star.get("B"), Some(&2));
+}
+
+#[test]
+fn test_table_aggregate_empty_returns_null() {
+    let mut table = ColumnTable::new("empty_table");
+    let empty_i = Int64Column::new("i");
+    let empty_f = Float64Column::new("f");
+    table.add_column(AnyColumn::Int64(empty_i)).unwrap();
+    table.add_column(AnyColumn::Float64(empty_f)).unwrap();
+
+    assert_eq!(
+        table.aggregate("i", AggregateOp::Sum, None).unwrap(),
+        AggregateValue::Null
+    );
+    assert_eq!(
+        table.aggregate("f", AggregateOp::Sum, None).unwrap(),
+        AggregateValue::Null
+    );
+    assert_eq!(
+        table.aggregate("i", AggregateOp::Avg, None).unwrap(),
+        AggregateValue::Null
+    );
+}
+
+#[test]
+fn test_zero_allocation_filter_into_and_selection_vector_pool() {
+    let mut pool = mini_columnar_engine::SelectionVectorPool::new();
+    let mut sel = pool.acquire(1024);
+
+    let vals: Vec<i64> = (0..10_000).collect();
+    let col = Int64Column::from_slice("v", &vals);
+
+    mini_columnar_engine::scan_filter_i64_into(&col, ComparisonOp::LessThan, 50, &mut sel);
+    assert_eq!(sel.len(), 50);
+
+    let mut sel2 = pool.acquire(1024);
+    mini_columnar_engine::scan_filter_i64_with_selection_into(
+        &col,
+        &sel,
+        ComparisonOp::GreaterThanOrEqual,
+        40,
+        &mut sel2,
+    );
+    assert_eq!(sel2.len(), 10);
+    assert_eq!(sel2.as_slice(), &[40, 41, 42, 43, 44, 45, 46, 47, 48, 49]);
+
+    pool.release(sel);
+    pool.release(sel2);
+}
+
+#[test]
+fn test_l1_morsel_chunked_pipelined_aggregation() {
+    let mut table = ColumnTable::new("chunk_pipeline");
+    let filter_vals: Vec<i64> = (0..5000).collect();
+    let data_vals: Vec<i64> = (0..5000).map(|i| i * 2).collect();
+
+    table
+        .add_column(AnyColumn::Int64(Int64Column::from_slice("f", &filter_vals)))
+        .unwrap();
+    table
+        .add_column(AnyColumn::Int64(Int64Column::from_slice("d", &data_vals)))
+        .unwrap();
+
+    // Condition: f >= 2000 AND f < 4000 (2000 rows, d values are 4000..8000 (step 2))
+    // Standard filtered execution
+    let sel = table
+        .filter_i64("f", ComparisonOp::GreaterThanOrEqual, 2000)
+        .unwrap();
+    let agg_sum_standard = table.aggregate("d", AggregateOp::Sum, Some(&sel)).unwrap();
+
+    // Chunked pipelined execution
+    let agg_sum_chunked = table
+        .aggregate_filtered_chunked_i64(
+            "f",
+            ComparisonOp::GreaterThanOrEqual,
+            2000,
+            "d",
+            AggregateOp::Sum,
+        )
+        .unwrap();
+
+    assert_eq!(agg_sum_standard, agg_sum_chunked);
+}
+
+#[test]
+fn test_dictionary_bits_per_key_and_bit_packed_bytes() {
+    let col_binary = DictionaryColumn::from_iter("flag", ["YES", "NO"]);
+    assert_eq!(col_binary.bits_per_key(), 1);
+    assert_eq!(col_binary.bit_packed_keys_bytes(), 1); // ceil(2 * 1 / 8) = 1
+
+    let col_hex = DictionaryColumn::from_iter(
+        "hex",
+        [
+            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F",
+        ],
+    );
+    assert_eq!(col_hex.bits_per_key(), 4);
+    assert_eq!(col_hex.bit_packed_keys_bytes(), 8); // ceil(16 * 4 / 8) = 8
 }

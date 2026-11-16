@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::column::bitmap::NullBitmap;
 use crate::column::dictionary::DictionaryColumn;
 use crate::column::numeric::{Float64Column, Int64Column};
 use crate::column::rle::RleColumn;
@@ -7,14 +8,18 @@ use crate::column::string::StringColumn;
 use crate::column::{Column, ColumnType};
 use crate::execution::aggregate::{
     avg_f64, avg_i64, count_dict, count_f64, count_i64, count_string, group_by_dict_avg_f64,
-    group_by_dict_avg_i64, group_by_dict_count, group_by_dict_max_f64, group_by_dict_max_i64,
-    group_by_dict_min_f64, group_by_dict_min_i64, group_by_dict_sum_f64, group_by_dict_sum_i64,
-    max_f64, max_i64, min_f64, min_i64, sum_f64, sum_i64, AggregateOp, AggregateValue,
+    group_by_dict_avg_i64, group_by_dict_count, group_by_dict_count_col, group_by_dict_max_f64,
+    group_by_dict_max_i64, group_by_dict_min_f64, group_by_dict_min_i64, group_by_dict_sum_f64,
+    group_by_dict_sum_i64, max_f64, max_i64, min_f64, min_i64, sum_f64, sum_i64, AggregateOp,
+    AggregateValue,
 };
 use crate::execution::filter::{
-    scan_filter_dict, scan_filter_dict_with_selection, scan_filter_f64,
-    scan_filter_f64_with_selection, scan_filter_i64, scan_filter_i64_with_selection, ComparisonOp,
-    SelectionVector,
+    scan_chunk_filter_i64_into, scan_filter_dict, scan_filter_dict_into,
+    scan_filter_dict_with_selection, scan_filter_dict_with_selection_into, scan_filter_f64,
+    scan_filter_f64_into, scan_filter_f64_with_selection, scan_filter_f64_with_selection_into,
+    scan_filter_i64, scan_filter_i64_into, scan_filter_i64_with_selection,
+    scan_filter_i64_with_selection_into, ComparisonOp, SelectionVector, VectorBatch,
+    VECTOR_CHUNK_SIZE,
 };
 
 /// Unified enum container representing any supported column storage type.
@@ -59,6 +64,16 @@ impl AnyColumn {
             AnyColumn::String(c) => c.column_type(),
             AnyColumn::Dictionary(c) => c.column_type(),
             AnyColumn::RleInt64(c) => c.column_type(),
+        }
+    }
+
+    pub fn null_bitmap(&self) -> Option<&NullBitmap> {
+        match self {
+            AnyColumn::Int64(c) => c.null_bitmap(),
+            AnyColumn::Float64(c) => c.null_bitmap(),
+            AnyColumn::String(c) => c.null_bitmap(),
+            AnyColumn::Dictionary(c) => c.null_bitmap(),
+            AnyColumn::RleInt64(c) => c.null_bitmap(),
         }
     }
 
@@ -188,6 +203,21 @@ impl ColumnTable {
         Ok(scan_filter_i64(col, op, target))
     }
 
+    /// In-place filter over an Int64 column writing matching row indices into `out`.
+    pub fn filter_i64_into(
+        &self,
+        col_name: &str,
+        op: ComparisonOp,
+        target: i64,
+        out: &mut SelectionVector,
+    ) -> Result<(), String> {
+        let col = self
+            .get_int64_column(col_name)
+            .ok_or_else(|| format!("Int64 column '{}' not found", col_name))?;
+        scan_filter_i64_into(col, op, target, out);
+        Ok(())
+    }
+
     /// Execute a vectorized filter scan over an integer column with an existing selection vector.
     pub fn filter_i64_with_sel(
         &self,
@@ -202,6 +232,22 @@ impl ColumnTable {
         Ok(scan_filter_i64_with_selection(col, sel, op, target))
     }
 
+    /// In-place chained filter over an Int64 column refining an existing `sel` into `out`.
+    pub fn filter_i64_with_sel_into(
+        &self,
+        col_name: &str,
+        op: ComparisonOp,
+        target: i64,
+        sel: &SelectionVector,
+        out: &mut SelectionVector,
+    ) -> Result<(), String> {
+        let col = self
+            .get_int64_column(col_name)
+            .ok_or_else(|| format!("Int64 column '{}' not found", col_name))?;
+        scan_filter_i64_with_selection_into(col, sel, op, target, out);
+        Ok(())
+    }
+
     /// Execute a vectorized filter scan over a float column.
     pub fn filter_f64(
         &self,
@@ -213,6 +259,21 @@ impl ColumnTable {
             .get_float64_column(col_name)
             .ok_or_else(|| format!("Float64 column '{}' not found", col_name))?;
         Ok(scan_filter_f64(col, op, target))
+    }
+
+    /// In-place filter over a Float64 column writing matching row indices into `out`.
+    pub fn filter_f64_into(
+        &self,
+        col_name: &str,
+        op: ComparisonOp,
+        target: f64,
+        out: &mut SelectionVector,
+    ) -> Result<(), String> {
+        let col = self
+            .get_float64_column(col_name)
+            .ok_or_else(|| format!("Float64 column '{}' not found", col_name))?;
+        scan_filter_f64_into(col, op, target, out);
+        Ok(())
     }
 
     /// Execute a vectorized filter scan over a float column with an existing selection vector.
@@ -229,6 +290,22 @@ impl ColumnTable {
         Ok(scan_filter_f64_with_selection(col, sel, op, target))
     }
 
+    /// In-place chained filter over a Float64 column refining an existing `sel` into `out`.
+    pub fn filter_f64_with_sel_into(
+        &self,
+        col_name: &str,
+        op: ComparisonOp,
+        target: f64,
+        sel: &SelectionVector,
+        out: &mut SelectionVector,
+    ) -> Result<(), String> {
+        let col = self
+            .get_float64_column(col_name)
+            .ok_or_else(|| format!("Float64 column '{}' not found", col_name))?;
+        scan_filter_f64_with_selection_into(col, sel, op, target, out);
+        Ok(())
+    }
+
     /// Execute a vectorized filter scan over a dictionary column.
     pub fn filter_dict(
         &self,
@@ -240,6 +317,21 @@ impl ColumnTable {
             .get_dict_column(col_name)
             .ok_or_else(|| format!("Dictionary column '{}' not found", col_name))?;
         Ok(scan_filter_dict(col, op, target))
+    }
+
+    /// In-place filter over a Dictionary column writing matching row indices into `out`.
+    pub fn filter_dict_into(
+        &self,
+        col_name: &str,
+        op: ComparisonOp,
+        target: &str,
+        out: &mut SelectionVector,
+    ) -> Result<(), String> {
+        let col = self
+            .get_dict_column(col_name)
+            .ok_or_else(|| format!("Dictionary column '{}' not found", col_name))?;
+        scan_filter_dict_into(col, op, target, out);
+        Ok(())
     }
 
     /// Execute a vectorized filter scan over a dictionary column with an existing selection vector.
@@ -256,6 +348,143 @@ impl ColumnTable {
         Ok(scan_filter_dict_with_selection(col, sel, op, target))
     }
 
+    /// In-place chained filter over a Dictionary column refining an existing `sel` into `out`.
+    pub fn filter_dict_with_sel_into(
+        &self,
+        col_name: &str,
+        op: ComparisonOp,
+        target: &str,
+        sel: &SelectionVector,
+        out: &mut SelectionVector,
+    ) -> Result<(), String> {
+        let col = self
+            .get_dict_column(col_name)
+            .ok_or_else(|| format!("Dictionary column '{}' not found", col_name))?;
+        scan_filter_dict_with_selection_into(col, sel, op, target, out);
+        Ok(())
+    }
+
+    /// COUNT(*) across the table, respecting any active selection vector.
+    pub fn count_star(&self, sel: Option<&SelectionVector>) -> usize {
+        match sel {
+            Some(s) => s.len(),
+            None => self.row_count,
+        }
+    }
+
+    /// Single-pass vectorized GROUP BY COUNT(*) over a dictionary grouping column.
+    pub fn group_by_count_star(
+        &self,
+        group_col_name: &str,
+        sel: Option<&SelectionVector>,
+    ) -> Result<Vec<(String, usize)>, String> {
+        let group_col = self
+            .get_dict_column(group_col_name)
+            .ok_or_else(|| format!("Dictionary group column '{}' not found", group_col_name))?;
+        Ok(group_by_dict_count(group_col, sel))
+    }
+
+    /// Pipelined chunked execution: filters `filter_col` and aggregates `val_col`
+    /// chunk-by-chunk (morsels of 1024 elements).
+    ///
+    /// The intermediate selection vector has at most 1024 entries (`4 KB`),
+    /// keeping intermediate indices strictly resident in L1 D-Cache without ever
+    /// allocating a global table-wide selection vector buffer.
+    pub fn aggregate_filtered_chunked_i64(
+        &self,
+        filter_col_name: &str,
+        filter_op: ComparisonOp,
+        filter_target: i64,
+        val_col_name: &str,
+        agg_op: AggregateOp,
+    ) -> Result<AggregateValue, String> {
+        let f_col = self
+            .get_int64_column(filter_col_name)
+            .ok_or_else(|| format!("Int64 filter column '{}' not found", filter_col_name))?;
+        let v_col = self
+            .get_int64_column(val_col_name)
+            .ok_or_else(|| format!("Int64 val column '{}' not found", val_col_name))?;
+
+        let mut sel_chunk = SelectionVector::with_capacity(VECTOR_CHUNK_SIZE);
+        let val_slice = v_col.as_slice();
+        let val_bm = v_col.null_bitmap();
+
+        let mut sum: i64 = 0;
+        let mut count: usize = 0;
+        let mut min_val: i64 = i64::MAX;
+        let mut max_val: i64 = i64::MIN;
+        let mut found = false;
+
+        let total_rows = self.row_count;
+        let mut chunk_start = 0;
+
+        while chunk_start < total_rows {
+            let chunk_end = (chunk_start + VECTOR_CHUNK_SIZE).min(total_rows);
+            let batch = VectorBatch::new(chunk_start, chunk_end - chunk_start);
+            scan_chunk_filter_i64_into(f_col, &batch, filter_op, filter_target, &mut sel_chunk);
+
+            for &row_idx in sel_chunk.as_slice() {
+                if let Some(bm) = val_bm {
+                    if bm.is_null(row_idx) {
+                        continue;
+                    }
+                }
+                let val = val_slice[row_idx];
+                found = true;
+                count += 1;
+                match agg_op {
+                    AggregateOp::Sum => sum += val,
+                    AggregateOp::Avg => sum += val,
+                    AggregateOp::Min => {
+                        if val < min_val {
+                            min_val = val;
+                        }
+                    }
+                    AggregateOp::Max => {
+                        if val > max_val {
+                            max_val = val;
+                        }
+                    }
+                    AggregateOp::Count => {}
+                }
+            }
+
+            chunk_start = chunk_end;
+        }
+
+        match agg_op {
+            AggregateOp::Sum => {
+                if found {
+                    Ok(AggregateValue::Int(sum))
+                } else {
+                    Ok(AggregateValue::Null)
+                }
+            }
+            AggregateOp::Avg => {
+                if count > 0 {
+                    Ok(AggregateValue::Float(sum as f64 / count as f64))
+                } else {
+                    Ok(AggregateValue::Null)
+                }
+            }
+            AggregateOp::Min => {
+                if found {
+                    Ok(AggregateValue::Int(min_val))
+                } else {
+                    Ok(AggregateValue::Null)
+                }
+            }
+            AggregateOp::Max => {
+                if found {
+                    Ok(AggregateValue::Int(max_val))
+                } else {
+                    Ok(AggregateValue::Null)
+                }
+            }
+            AggregateOp::Count => Ok(AggregateValue::Count(count)),
+        }
+    }
+
     /// Execute an analytical aggregation over a numeric column, optionally filtered by `sel`.
     pub fn aggregate(
         &self,
@@ -269,7 +498,10 @@ impl ColumnTable {
 
         match col {
             AnyColumn::Int64(c) => match op {
-                AggregateOp::Sum => Ok(AggregateValue::Int(sum_i64(c, sel))),
+                AggregateOp::Sum => match sum_i64(c, sel) {
+                    Some(s) => Ok(AggregateValue::Int(s)),
+                    None => Ok(AggregateValue::Null),
+                },
                 AggregateOp::Avg => match avg_i64(c, sel) {
                     Some(a) => Ok(AggregateValue::Float(a)),
                     None => Ok(AggregateValue::Null),
@@ -285,7 +517,10 @@ impl ColumnTable {
                 AggregateOp::Count => Ok(AggregateValue::Count(count_i64(c, sel))),
             },
             AnyColumn::Float64(c) => match op {
-                AggregateOp::Sum => Ok(AggregateValue::Float(sum_f64(c, sel))),
+                AggregateOp::Sum => match sum_f64(c, sel) {
+                    Some(s) => Ok(AggregateValue::Float(s)),
+                    None => Ok(AggregateValue::Null),
+                },
                 AggregateOp::Avg => match avg_f64(c, sel) {
                     Some(a) => Ok(AggregateValue::Float(a)),
                     None => Ok(AggregateValue::Null),
@@ -301,7 +536,10 @@ impl ColumnTable {
                 AggregateOp::Count => Ok(AggregateValue::Count(count_f64(c, sel))),
             },
             AnyColumn::RleInt64(c) => match op {
-                AggregateOp::Sum => Ok(AggregateValue::Int(c.sum())),
+                AggregateOp::Sum => match c.sum() {
+                    Some(s) => Ok(AggregateValue::Int(s)),
+                    None => Ok(AggregateValue::Null),
+                },
                 AggregateOp::Count => Ok(AggregateValue::Count(c.len())),
                 AggregateOp::Min => match c.min() {
                     Some(m) => Ok(AggregateValue::Int(m)),
@@ -455,7 +693,7 @@ impl ColumnTable {
                     .collect())
             }
             (_, AggregateOp::Count) => {
-                let results = group_by_dict_count(group_col, sel);
+                let results = group_by_dict_count_col(group_col, val_col.null_bitmap(), sel);
                 Ok(results
                     .into_iter()
                     .map(|(k, v)| (k, AggregateValue::Count(v)))

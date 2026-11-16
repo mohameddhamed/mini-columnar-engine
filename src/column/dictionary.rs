@@ -183,6 +183,27 @@ impl DictionaryColumn {
         self.dictionary.len()
     }
 
+    /// Calculate minimum bits required per surrogate key based on dictionary cardinality.
+    /// In modern columnar formats (SAP HANA, Apache Arrow, DuckDB), keys are bit-packed
+    /// (e.g. 2 bits for 4 regions, 3 bits for 8 activities) to maximize L1/L2 cache residency.
+    #[inline(always)]
+    pub fn bits_per_key(&self) -> usize {
+        let card = self.cardinality();
+        if card <= 1 {
+            1
+        } else {
+            usize::BITS as usize - (card - 1).leading_zeros() as usize
+        }
+    }
+
+    /// Calculate memory footprint if surrogate keys were bit-packed
+    /// according to cardinality rather than full 32-bit words.
+    pub fn bit_packed_keys_bytes(&self) -> usize {
+        let bpk = self.bits_per_key();
+        let total_bits = self.keys.len() * bpk;
+        total_bits.div_ceil(8)
+    }
+
     /// Calculate memory footprint comparison vs uncompressed raw strings.
     pub fn raw_string_bytes_estimate(&self) -> usize {
         self.keys

@@ -262,7 +262,7 @@ fn main() {
 
     println!("  • Total rows:               {:>12}", rle_col.len());
     println!("  • Total runs:               {:>12}", rle_col.num_runs());
-    println!("  • RLE SUM result:           {:>12}", rle_sum);
+    println!("  • RLE SUM result:           {:>12}", rle_sum.unwrap_or(0));
     println!("  • O(runs) evaluation time:  {:>12.2?}", dur_rle);
     println!("\nAll architectural guarantees verified successfully.");
 }

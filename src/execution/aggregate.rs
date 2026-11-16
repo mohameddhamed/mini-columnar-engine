@@ -77,20 +77,30 @@ pub fn count_i64(col: &Int64Column, sel: Option<&SelectionVector>) -> usize {
 ///
 /// Uses 4-way independent accumulator unrolling when scanning full contiguous slices,
 /// breaking CPU instruction dependency chains and maximizing superscalar pipeline throughput.
-pub fn sum_i64(col: &Int64Column, sel: Option<&SelectionVector>) -> i64 {
+/// Adheres strictly to SQL standard: returns `None` on empty or all-null selection.
+pub fn sum_i64(col: &Int64Column, sel: Option<&SelectionVector>) -> Option<i64> {
     let data = col.as_slice();
 
     match sel {
         Some(sv) => {
             let indices = sv.as_slice();
+            if indices.is_empty() {
+                return None;
+            }
             if let Some(bm) = col.null_bitmap() {
                 let mut sum = 0i64;
+                let mut found = false;
                 for &idx in indices {
                     if bm.is_valid(idx) {
+                        found = true;
                         sum += data[idx];
                     }
                 }
-                sum
+                if found {
+                    Some(sum)
+                } else {
+                    None
+                }
             } else {
                 let mut sum0 = 0i64;
                 let mut sum1 = 0i64;
@@ -112,18 +122,27 @@ pub fn sum_i64(col: &Int64Column, sel: Option<&SelectionVector>) -> i64 {
                     sum0 += data[idx];
                 }
 
-                sum0 + sum1 + sum2 + sum3
+                Some(sum0 + sum1 + sum2 + sum3)
             }
         }
         None => {
+            if data.is_empty() {
+                return None;
+            }
             if let Some(bm) = col.null_bitmap() {
                 let mut sum = 0i64;
+                let mut found = false;
                 for (i, &v) in data.iter().enumerate() {
                     if bm.is_valid(i) {
+                        found = true;
                         sum += v;
                     }
                 }
-                sum
+                if found {
+                    Some(sum)
+                } else {
+                    None
+                }
             } else {
                 let mut sum0 = 0i64;
                 let mut sum1 = 0i64;
@@ -145,7 +164,7 @@ pub fn sum_i64(col: &Int64Column, sel: Option<&SelectionVector>) -> i64 {
                     sum0 += v;
                 }
 
-                sum0 + sum1 + sum2 + sum3
+                Some(sum0 + sum1 + sum2 + sum3)
             }
         }
     }
@@ -158,7 +177,7 @@ pub fn avg_i64(col: &Int64Column, sel: Option<&SelectionVector>) -> Option<f64> 
         return None;
     }
 
-    let sum = sum_i64(col, sel);
+    let sum = sum_i64(col, sel)?;
     Some(sum as f64 / count as f64)
 }
 
@@ -319,20 +338,29 @@ pub fn count_f64(col: &Float64Column, sel: Option<&SelectionVector>) -> usize {
     }
 }
 
-pub fn sum_f64(col: &Float64Column, sel: Option<&SelectionVector>) -> f64 {
+pub fn sum_f64(col: &Float64Column, sel: Option<&SelectionVector>) -> Option<f64> {
     let data = col.as_slice();
 
     match sel {
         Some(sv) => {
             let indices = sv.as_slice();
+            if indices.is_empty() {
+                return None;
+            }
             if let Some(bm) = col.null_bitmap() {
                 let mut sum = 0.0f64;
+                let mut found = false;
                 for &idx in indices {
                     if bm.is_valid(idx) {
+                        found = true;
                         sum += data[idx];
                     }
                 }
-                sum
+                if found {
+                    Some(sum)
+                } else {
+                    None
+                }
             } else {
                 let mut sum0 = 0.0f64;
                 let mut sum1 = 0.0f64;
@@ -354,18 +382,27 @@ pub fn sum_f64(col: &Float64Column, sel: Option<&SelectionVector>) -> f64 {
                     sum0 += data[idx];
                 }
 
-                sum0 + sum1 + sum2 + sum3
+                Some(sum0 + sum1 + sum2 + sum3)
             }
         }
         None => {
+            if data.is_empty() {
+                return None;
+            }
             if let Some(bm) = col.null_bitmap() {
                 let mut sum = 0.0f64;
+                let mut found = false;
                 for (i, &v) in data.iter().enumerate() {
                     if bm.is_valid(i) {
+                        found = true;
                         sum += v;
                     }
                 }
-                sum
+                if found {
+                    Some(sum)
+                } else {
+                    None
+                }
             } else {
                 let mut sum0 = 0.0f64;
                 let mut sum1 = 0.0f64;
@@ -387,7 +424,7 @@ pub fn sum_f64(col: &Float64Column, sel: Option<&SelectionVector>) -> f64 {
                     sum0 += v;
                 }
 
-                sum0 + sum1 + sum2 + sum3
+                Some(sum0 + sum1 + sum2 + sum3)
             }
         }
     }
@@ -399,7 +436,7 @@ pub fn avg_f64(col: &Float64Column, sel: Option<&SelectionVector>) -> Option<f64
         return None;
     }
 
-    let sum = sum_f64(col, sel);
+    let sum = sum_f64(col, sel)?;
     Some(sum / count as f64)
 }
 
@@ -553,6 +590,7 @@ pub fn group_by_dict_sum_i64(
 ) -> Vec<(String, i64)> {
     let card = group_col.cardinality();
     let mut sums = vec![0i64; card];
+    let mut counts = vec![0usize; card];
     let keys = group_col.keys();
     let vals = val_col.as_slice();
     let group_bm = group_col.null_bitmap();
@@ -570,6 +608,7 @@ pub fn group_by_dict_sum_i64(
                 let key = keys[idx] as usize;
                 if key < card {
                     sums[key] += vals[idx];
+                    counts[key] += 1;
                 }
             }
         }
@@ -585,6 +624,7 @@ pub fn group_by_dict_sum_i64(
                 let key = keys[i] as usize;
                 if key < card {
                     sums[key] += vals[i];
+                    counts[key] += 1;
                 }
             }
         }
@@ -593,6 +633,7 @@ pub fn group_by_dict_sum_i64(
     let dict = group_col.dictionary();
     dict.iter()
         .enumerate()
+        .filter(|(id, _)| counts[*id] > 0)
         .map(|(id, token)| (token.clone(), sums[id]))
         .collect()
 }
@@ -605,6 +646,7 @@ pub fn group_by_dict_sum_f64(
 ) -> Vec<(String, f64)> {
     let card = group_col.cardinality();
     let mut sums = vec![0.0f64; card];
+    let mut counts = vec![0usize; card];
     let keys = group_col.keys();
     let vals = val_col.as_slice();
     let group_bm = group_col.null_bitmap();
@@ -622,6 +664,7 @@ pub fn group_by_dict_sum_f64(
                 let key = keys[idx] as usize;
                 if key < card {
                     sums[key] += vals[idx];
+                    counts[key] += 1;
                 }
             }
         }
@@ -637,6 +680,7 @@ pub fn group_by_dict_sum_f64(
                 let key = keys[i] as usize;
                 if key < card {
                     sums[key] += vals[i];
+                    counts[key] += 1;
                 }
             }
         }
@@ -645,6 +689,7 @@ pub fn group_by_dict_sum_f64(
     let dict = group_col.dictionary();
     dict.iter()
         .enumerate()
+        .filter(|(id, _)| counts[*id] > 0)
         .map(|(id, token)| (token.clone(), sums[id]))
         .collect()
 }
@@ -687,6 +732,58 @@ pub fn group_by_dict_count(
     let dict = group_col.dictionary();
     dict.iter()
         .enumerate()
+        .filter(|(id, _)| counts[*id] > 0)
+        .map(|(id, token)| (token.clone(), counts[id]))
+        .collect()
+}
+
+/// Single-pass vectorized GROUP BY over `DictionaryColumn` with `COUNT(val_col)`,
+/// strictly excluding rows where `val_col` is null.
+pub fn group_by_dict_count_col(
+    group_col: &DictionaryColumn,
+    val_null_bitmap: Option<&crate::column::bitmap::NullBitmap>,
+    sel: Option<&SelectionVector>,
+) -> Vec<(String, usize)> {
+    let card = group_col.cardinality();
+    let mut counts = vec![0usize; card];
+    let keys = group_col.keys();
+    let group_bm = group_col.null_bitmap();
+
+    match sel {
+        Some(sv) => {
+            for &idx in sv.as_slice() {
+                if group_bm.is_some_and(|bm| bm.is_null(idx)) {
+                    continue;
+                }
+                if val_null_bitmap.is_some_and(|bm| bm.is_null(idx)) {
+                    continue;
+                }
+                let key = keys[idx] as usize;
+                if key < card {
+                    counts[key] += 1;
+                }
+            }
+        }
+        None => {
+            for (i, &k) in keys.iter().enumerate() {
+                if group_bm.is_some_and(|bm| bm.is_null(i)) {
+                    continue;
+                }
+                if val_null_bitmap.is_some_and(|bm| bm.is_null(i)) {
+                    continue;
+                }
+                let key = k as usize;
+                if key < card {
+                    counts[key] += 1;
+                }
+            }
+        }
+    }
+
+    let dict = group_col.dictionary();
+    dict.iter()
+        .enumerate()
+        .filter(|(id, _)| counts[*id] > 0)
         .map(|(id, token)| (token.clone(), counts[id]))
         .collect()
 }
@@ -736,13 +833,10 @@ pub fn group_by_dict_avg_i64(
     let dict = group_col.dictionary();
     dict.iter()
         .enumerate()
+        .filter(|(id, _)| counts[*id] > 0)
         .map(|(id, token)| {
-            let avg = if counts[id] > 0 {
-                Some(sums[id] as f64 / counts[id] as f64)
-            } else {
-                None
-            };
-            (token.clone(), avg)
+            let avg = sums[id] as f64 / counts[id] as f64;
+            (token.clone(), Some(avg))
         })
         .collect()
 }
@@ -792,13 +886,10 @@ pub fn group_by_dict_avg_f64(
     let dict = group_col.dictionary();
     dict.iter()
         .enumerate()
+        .filter(|(id, _)| counts[*id] > 0)
         .map(|(id, token)| {
-            let avg = if counts[id] > 0 {
-                Some(sums[id] / counts[id] as f64)
-            } else {
-                None
-            };
-            (token.clone(), avg)
+            let avg = sums[id] / counts[id] as f64;
+            (token.clone(), Some(avg))
         })
         .collect()
 }
@@ -847,7 +938,8 @@ pub fn group_by_dict_min_i64(
     let dict = group_col.dictionary();
     dict.iter()
         .enumerate()
-        .map(|(id, token)| (token.clone(), if found[id] { Some(mins[id]) } else { None }))
+        .filter(|(id, _)| found[*id])
+        .map(|(id, token)| (token.clone(), Some(mins[id])))
         .collect()
 }
 
@@ -895,7 +987,8 @@ pub fn group_by_dict_max_i64(
     let dict = group_col.dictionary();
     dict.iter()
         .enumerate()
-        .map(|(id, token)| (token.clone(), if found[id] { Some(maxs[id]) } else { None }))
+        .filter(|(id, _)| found[*id])
+        .map(|(id, token)| (token.clone(), Some(maxs[id])))
         .collect()
 }
 
@@ -943,7 +1036,8 @@ pub fn group_by_dict_min_f64(
     let dict = group_col.dictionary();
     dict.iter()
         .enumerate()
-        .map(|(id, token)| (token.clone(), if found[id] { Some(mins[id]) } else { None }))
+        .filter(|(id, _)| found[*id])
+        .map(|(id, token)| (token.clone(), Some(mins[id])))
         .collect()
 }
 
@@ -991,7 +1085,8 @@ pub fn group_by_dict_max_f64(
     let dict = group_col.dictionary();
     dict.iter()
         .enumerate()
-        .map(|(id, token)| (token.clone(), if found[id] { Some(maxs[id]) } else { None }))
+        .filter(|(id, _)| found[*id])
+        .map(|(id, token)| (token.clone(), Some(maxs[id])))
         .collect()
 }
 
@@ -1006,18 +1101,51 @@ pub fn group_by_raw_string_sum_i64(
     match sel {
         Some(sv) => {
             for &idx in sv.as_slice() {
-                *map.entry(groups[idx].clone()).or_insert(0) += vals[idx];
+                if let Some(entry) = map.get_mut(&groups[idx]) {
+                    *entry += vals[idx];
+                } else {
+                    map.insert(groups[idx].clone(), vals[idx]);
+                }
             }
         }
         None => {
             let total = groups.len().min(vals.len());
             for i in 0..total {
-                *map.entry(groups[i].clone()).or_insert(0) += vals[i];
+                if let Some(entry) = map.get_mut(&groups[i]) {
+                    *entry += vals[i];
+                } else {
+                    map.insert(groups[i].clone(), vals[i]);
+                }
             }
         }
     }
 
     map.into_iter().collect()
+}
+
+/// Idiomatic borrowed `&str` HashMap grouping (zero string heap allocations).
+pub fn group_by_borrowed_str_sum_i64<'a>(
+    groups: &'a [String],
+    vals: &[i64],
+    sel: Option<&SelectionVector>,
+) -> HashMap<&'a str, i64> {
+    let mut map: HashMap<&'a str, i64> = HashMap::new();
+
+    match sel {
+        Some(sv) => {
+            for &idx in sv.as_slice() {
+                *map.entry(groups[idx].as_str()).or_insert(0) += vals[idx];
+            }
+        }
+        None => {
+            let total = groups.len().min(vals.len());
+            for i in 0..total {
+                *map.entry(groups[i].as_str()).or_insert(0) += vals[i];
+            }
+        }
+    }
+
+    map
 }
 
 /// Count valid (non-null) rows in a `DictionaryColumn`, optionally constrained by a selection vector.

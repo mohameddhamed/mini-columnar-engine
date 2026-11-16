@@ -100,12 +100,16 @@ impl<T: Clone + PartialEq> RleColumn<T> {
 impl RleColumn<i64> {
     /// Vectorized/algebraic SUM on RLE-compressed i64 data.
     /// Runs in O(num_runs) instead of O(total_len) using multiplication!
-    pub fn sum(&self) -> i64 {
+    /// Returns None on empty column adhering to SQL / PQL null semantics.
+    pub fn sum(&self) -> Option<i64> {
+        if self.total_len == 0 {
+            return None;
+        }
         let mut total = 0i64;
         for (&val, &cnt) in self.values.iter().zip(self.counts.iter()) {
             total += val * (cnt as i64);
         }
-        total
+        Some(total)
     }
 
     /// O(runs) MIN over RLE-compressed i64 data.
@@ -120,11 +124,7 @@ impl RleColumn<i64> {
 
     /// O(runs) AVG over RLE-compressed i64 data.
     pub fn avg(&self) -> Option<f64> {
-        if self.total_len == 0 {
-            None
-        } else {
-            Some(self.sum() as f64 / self.total_len as f64)
-        }
+        self.sum().map(|s| s as f64 / self.total_len as f64)
     }
 }
 

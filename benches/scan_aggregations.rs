@@ -2,11 +2,15 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 
 use mini_columnar_engine::column::dictionary::DictionaryColumn;
 use mini_columnar_engine::column::numeric::Int64Column;
+use mini_columnar_engine::column::rle::RleColumn;
 use mini_columnar_engine::column::string::StringColumn;
 use mini_columnar_engine::execution::aggregate::{
-    group_by_dict_sum_i64, group_by_raw_string_sum_i64, sum_i64,
+    group_by_borrowed_str_sum_i64, group_by_dict_sum_i64, group_by_raw_string_sum_i64, sum_i64,
 };
-use mini_columnar_engine::execution::filter::{scan_filter_dict, scan_filter_i64, ComparisonOp};
+use mini_columnar_engine::execution::filter::{
+    scan_chunk_filter_i64, scan_filter_dict, scan_filter_i64, scan_filter_i64_into, ComparisonOp,
+    SelectionVectorPool,
+};
 
 /// Row-oriented structure representing a wide OLTP tuple (64 bytes).
 #[derive(Clone)]
@@ -47,12 +51,14 @@ fn bench_row_vs_columnar_scan(c: &mut Criterion) {
     // Prepare Contiguous Columnar Buffer
     let col = Int64Column::from_iter("payload_metric", (0..N).map(|i| (i % 1000) as i64));
 
-    // Row-oriented baseline: iterates over 64-byte structs, thrashing cache lines
+    // Row-oriented baseline: iterates over 64-byte structs, thrashing cache lines.
+    // black_box is applied symmetrically to the slice reference.
     group.bench_function(BenchmarkId::new("RowOriented", N), |b| {
         b.iter(|| {
+            let r_slice = black_box(&rows);
             let mut sum = 0i64;
-            for r in &rows {
-                sum += black_box(r.payload_metric);
+            for r in r_slice {
+                sum += r.payload_metric;
             }
             sum
         });
@@ -134,12 +140,26 @@ fn bench_scalar_vs_vectorized_filter(c: &mut Criterion) {
         });
     });
 
+    // Zero-allocation Vector Filter into pooled SelectionVector
+    let mut pool = SelectionVectorPool::new();
+    group.bench_function(BenchmarkId::new("ZeroAllocVectorFilter", N), |b| {
+        let mut out = pool.acquire(N / 2);
+        b.iter(|| {
+            scan_filter_i64_into(
+                black_box(&col),
+                ComparisonOp::GreaterThan,
+                black_box(threshold),
+                black_box(&mut out),
+            );
+        });
+    });
+
     // Chunked Vectorized Processing (1024-element vector chunks)
     group.bench_function(BenchmarkId::new("ChunkedVectorFilter_1024", N), |b| {
         b.iter(|| {
             let mut total_matches = 0usize;
             for chunk in mini_columnar_engine::vector_chunks(col.len(), 1024) {
-                let sel = mini_columnar_engine::scan_chunk_filter_i64(
+                let sel = scan_chunk_filter_i64(
                     black_box(&col),
                     &chunk,
                     ComparisonOp::GreaterThan,
@@ -184,9 +204,16 @@ fn bench_group_by_direct_vs_hashmap(c: &mut Criterion) {
     }
     let val_col = Int64Column::from_iter("amount", values.clone());
 
-    // Traditional HashMap Group By
-    group.bench_function(BenchmarkId::new("HashMapGroupBy", N), |b| {
+    // Traditional HashMap Group By with owned Strings
+    group.bench_function(BenchmarkId::new("HashMapOwnedString", N), |b| {
         b.iter(|| group_by_raw_string_sum_i64(black_box(&group_strings), black_box(&values), None));
+    });
+
+    // Optimized HashMap Group By with borrowed &str (zero string cloning)
+    group.bench_function(BenchmarkId::new("HashMapBorrowedStr", N), |b| {
+        b.iter(|| {
+            group_by_borrowed_str_sum_i64(black_box(&group_strings), black_box(&values), None)
+        });
     });
 
     // Columnar Direct-Indexed Group By (SAP HANA style)
@@ -197,11 +224,50 @@ fn bench_group_by_direct_vs_hashmap(c: &mut Criterion) {
     group.finish();
 }
 
+// -----------------------------------------------------------------------------
+// Benchmark 5: RLE Algebraic Sum vs Dense Columnar Scan (1,000,000 rows)
+// -----------------------------------------------------------------------------
+fn bench_rle_algebraic_sum(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Rle_Algebraic_vs_Dense_Scan");
+    const N: usize = 1_000_000;
+    group.throughput(Throughput::Elements(N as u64));
+
+    let mut rle = RleColumn::new("status_code");
+    for _ in 0..400_000 {
+        rle.push(100i64);
+    }
+    for _ in 0..300_000 {
+        rle.push(200i64);
+    }
+    for _ in 0..200_000 {
+        rle.push(300i64);
+    }
+    for _ in 0..100_000 {
+        rle.push(400i64);
+    }
+
+    let dense_vals = rle.decompress();
+    let dense_col = Int64Column::from_slice("dense_status", &dense_vals);
+
+    // Dense contiguous scan: iterates through 1,000,000 elements
+    group.bench_function(BenchmarkId::new("DenseColumnarScan", N), |b| {
+        b.iter(|| sum_i64(black_box(&dense_col), None));
+    });
+
+    // RLE algebraic evaluation: 4 multiplications and 3 additions (O(runs))
+    group.bench_function(BenchmarkId::new("RleAlgebraicSum", N), |b| {
+        b.iter(|| black_box(&rle).sum());
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_row_vs_columnar_scan,
     bench_raw_string_vs_dictionary_filter,
     bench_scalar_vs_vectorized_filter,
-    bench_group_by_direct_vs_hashmap
+    bench_group_by_direct_vs_hashmap,
+    bench_rle_algebraic_sum,
 );
 criterion_main!(benches);
