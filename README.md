@@ -255,6 +255,5 @@ mini-columnar-engine/
 ## Author
 
 **Mohamed Hamed**  
-*M.Sc. in Software Architecture @ ELTE (Jan 2027) | B.Sc. CS @ ELTE (2025)*  
-*Former SAP Core HANA Engine & ExxonMobil Distributed Systems Engineer*  
-*Candidate for Senior Software Engineer - Query Engine & Database Systems @ Celonis*
+*M.Sc. in Software Architecture @ ELTE*  
+*SAP & Ex-ExxonMobil Systems Engineer*
