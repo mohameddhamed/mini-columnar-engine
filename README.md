@@ -4,9 +4,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Rust: 1.80+](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
 
-**A lean, production-grade vectorized in-memory OLAP (Online Analytical Processing) micro-database engine in Rust.**
+**An in-memory prototype of typed columnar analytical operators in Rust.**
 
-Architected to demonstrate the core database systems internals powering **SAP HANA's TableStore** and **Celonis's PQL (Process Query Language) Analytical Engine**: contiguous columnar memory layouts, bit-packed null masks, dictionary compression, vectorized filter pushdown with selection vectors, and direct-indexed grouping.
+The operators use contiguous columns, bit-packed null masks, dictionary encoding, selection vectors and direct-indexed grouping. Grouped results can omit null keys and groups whose values are all null.
 
 ---
 
@@ -21,7 +21,7 @@ Architected to demonstrate the core database systems internals powering **SAP HA
    - [Pillar 4: Analytical Aggregations & Direct-Indexed Group By](#pillar-4-analytical-aggregations--direct-indexed-group-by)
 4. [Architecture & Memory Layout Diagrams](#4-architecture--memory-layout-diagrams)
 5. [Empirical Benchmark Evidence (Criterion)](#5-empirical-benchmark-evidence-criterion)
-6. [Celonis PQL & SAP HANA Strategic Alignment](#6-celonis-pql--sap-hana-strategic-alignment)
+
 7. [Quickstart & Verification](#7-quickstart--verification)
 
 ---
@@ -80,7 +80,7 @@ Duration Buffer: [ D0 (8B) | D1 (8B) | D2 (8B) | D3 (8B) | D4 (8B) | D5 (8B) | D
   - 1 bit per row: `1` = Valid (Not Null), `0` = Null.
   - Reduces null metadata overhead to **0.125 bytes per row** (8x smaller than a boolean array and 64x smaller than tagged union padding).
   - Enables bitwise logical operations (`bit_and`, `bit_or`, `bit_not`) using 64-bit word operations.
-  - **Bit-Parallel Null Skipping:** Vectorized scans inspect raw 64-bit words; entire 64-row null chunks (`word == 0`) are skipped in a single clock cycle, while fully valid words (`word == u64::MAX`) bypass null checks entirely for maximum loop unrolling throughput.
+  - **Bit-Parallel Null Skipping:** Vectorized scans inspect raw 64-bit words; entire 64-row null chunks (`word == 0`) are skipped as a unit, while fully valid words (`word == u64::MAX`) bypass null checks entirely for maximum loop unrolling throughput.
   - **Scratch Buffer Arena (`SelectionVectorPool`):** In-place filtering (`scan_filter_*_into`) allows reuse of pre-allocated selection vectors across query stages, achieving zero heap allocations on the hot path.
 
 ### Pillar 2: Lightweight Database Compression (Dictionary & RLE)
@@ -95,7 +95,7 @@ Duration Buffer: [ D0 (8B) | D1 (8B) | D2 (8B) | D3 (8B) | D4 (8B) | D5 (8B) | D
 - **Run-Length Encoding (`RleColumn`):**
   - Consecutive repeated values are compressed into `(value, count)` runs.
   - Enables algebraic aggregation: $\text{SUM} = \sum (\text{value}_i \times \text{count}_i)$ in $O(\text{runs})$ time rather than $O(\text{rows})$, with $O(\text{runs})$ mathematical evaluations for `MIN`, `MAX`, and `AVG`.
-  - **SQL/PQL Null Parity:** Returns `None` (`AggregateValue::Null`) on empty columns or empty selection vectors, strictly adhering to OLAP standards.
+  - **Empty reductions:** Where applicable, scalar reductions return `None` for empty inputs.
 
 ### Pillar 3: Vectorized Execution & Predicate Pushdown
 
@@ -110,8 +110,8 @@ Duration Buffer: [ D0 (8B) | D1 (8B) | D2 (8B) | D3 (8B) | D4 (8B) | D5 (8B) | D
 
 ### Pillar 4: Analytical Aggregations & Direct-Indexed Group By
 
-- **Loop-Unrolled Aggregators:** Numerical aggregations (`SUM`, `AVG`, `MIN`, `MAX`, `COUNT`) employ 4 independent accumulator registers to saturate superscalar execution units, with strict null propagation ensuring mathematical parity.
-- **Strict SQL / PQL Null Semantics:**
+- **Loop-Unrolled Aggregators:** Numerical operations use independent accumulators on some scan paths and validity checks for nullable input.
+- **Scalar aggregate behavior:**
   - `SUM` over all-null or empty selection yields `NULL` (`None`).
   - `AVG` strictly divides by `valid_count`, never total selection length.
   - `COUNT(col)` respects null masks, while `COUNT(*)` counts all physical rows.
@@ -120,7 +120,7 @@ Duration Buffer: [ D0 (8B) | D1 (8B) | D2 (8B) | D3 (8B) | D4 (8B) | D5 (8B) | D
   - Rather than maintaining an expensive `std::collections::HashMap` (which causes pointer chasing, hashing latency, and hash collision chains), the engine allocates a contiguous vector of accumulators `Vec<Accumulator>` of length $K$.
   - Group updates are direct array accesses: `accumulators[surrogate_id as usize] += value`.
   - Supports `SUM`, `AVG`, `MIN`, `MAX`, and `COUNT` with zero hashing, zero hash collision resolution, zero heap allocation, and 100% L1 cache residency.
-  - **Phantom Group Elimination:** Prunes groups with zero valid matching rows in the active selection vector, guaranteeing identical result sets to SQL/PQL standards.
+  - **Group materialization:** Output can omit null grouping keys and groups whose selected values are all null.
 
 ---
 
@@ -168,40 +168,7 @@ Duration Buffer: [ D0 (8B) | D1 (8B) | D2 (8B) | D3 (8B) | D4 (8B) | D5 (8B) | D
 
 ## 5. Empirical Benchmark Evidence (Criterion)
 
-Benchmarks were executed on an Apple Silicon M-series ARM64 architecture (64-byte cache line size, L1 D-Cache: 64 KB, 16 GB unified memory). Each test suite processed **1,000,000 records** using **Criterion.rs** with 100 statistical samples:
-
-| Benchmark Case | Baseline (Row / HashMap / Scalar) | `mini-columnar-engine` (Vectorized) | Speedup Factor | Throughput |
-| :--- | :--- | :--- | :--- | :--- |
-| **Row-Oriented vs. Columnar Scan + Sum** | `1.058 ms` (Array of Structs) | **`252.4 µs`** (Contiguous Slice) | **4.19x Faster** | **3.96 Billion elem/sec** |
-| **Raw String Scan vs. Dictionary Filter** | `2.840 ms` (Byte slice scan) | **`471.0 µs`** (Integer surrogate scan) | **6.03x Faster** | **2.12 Billion elem/sec** |
-| **Scalar Iterator vs. Vectorized Pushdown** | `1.193 ms` (Volcano iterator) | **`620.4 µs`** (Selection vector chunk)<br>**`581.1 µs`** (Zero-alloc into buffer) | **2.05x Faster** | **1.72 Billion elem/sec** |
-| **GROUP BY: HashMap vs. Direct-Indexed** | `16.81 ms` (`HashMap<String, i64>`)<br>`30.22 ms` (`HashMap<&str, i64>`) | **`1.025 ms`** (Direct array index) | **16.4x - 29.5x Faster** | **975.5 Million elem/sec** |
-| **Run-Length Encoded (RLE) Sum** | `246.7 µs` (Dense columnar scan) | **`2.058 ns`** ($O(\text{runs})$ algebraic sum) | **>119,000x Faster** | **Instantaneous** |
-| **Memory Footprint (1M records)** | `99.18 MB` (Row-oriented heap) | **`38.15 MB`** (Columnar + Dictionary) | **2.60x Compression** | **61.5% RAM Saved** |
-
-### Key Benchmark Takeaways
-
-1. **3.96 Billion Elements per Second:** Scanning contiguous 64-bit integers achieves ~4.0 billion rows per second on a single thread due to memory prefetcher saturation, loop unrolling, and SIMD execution.
-2. **Up to 29.5x Speedup on Group-By:** Replacing generic hash table hashing, pointer dereferencing, and bucket reallocations with direct-indexed array accumulation reduces grouping runtime from **16.8–30.2 ms down to 1.02 ms**.
-3. **6.03x String Filter Acceleration:** Evaluating string predicates directly over contiguous 32-bit surrogate integer keys completely circumvents string traversal and CPU cache trashing.
-4. **Zero-Allocation Vector Filtering:** Eliminating bounds checks via fixed-size slice matching and reusing pre-allocated selection buffers cuts vectorized filter runtime by **37.7%** (from 956 µs to 581 µs).
-5. **>119,000x Algebraic RLE Sum:** Aggregating run-length encoded columns algebraically evaluates 1,000,000 rows in **2.05 ns** (4 scalar multiplications and 3 additions).
-
----
-
-## 6. Celonis PQL & SAP HANA Strategic Alignment
-
-The architectural foundations of `mini-columnar-engine` directly mirror the database systems paradigms implemented in **SAP HANA TableStore** and **Celonis's PQL Execution Engine**:
-
-| Architecture Component | SAP HANA / Celonis PQL Implementation | `mini-columnar-engine` Implementation |
-| :--- | :--- | :--- |
-| **In-Memory Storage** | SAP HANA Column Store (`TableStore` / `AttributeStore`) | `ColumnTable` storing typed, contiguous `Column` slices |
-| **Missing Values** | Decoupled bit-packed null vectors | `NullBitmap` (1-bit-per-row, 64-bit word operations) |
-| **String Storage** | Dictionary encoding with integer value IDs | `DictionaryColumn` with `Vec<u32>` surrogate keys and `Vec<String>` token pool |
-| **Predicate Pushdown** | PQL filter pushdown into HANA surrogate scan | `scan_filter_dict` with $O(1)$ pruning and integer scanning |
-| **Intermediate Buffers** | Selection vectors / row index bitmasks | `SelectionVector` passing matching row offsets between query operators |
-| **Process Aggregation** | PQL Event Log Aggregations (`CALC_THROUGHPUT`, `COUNT_TABLE`) | Direct-indexed grouping over dictionary surrogate IDs (`group_by_dict_sum`) |
-| **Run Compression** | SAP HANA Run-Length / Prefix / Bit-Packed Compression | `RleColumn` with $O(\text{runs})$ algebraic sum evaluation |
+Archived Apple Silicon Criterion estimates for one million integer values give 0.2525 ms for contiguous scan plus sum (about 3.96 billion elements/s). For one million rows and eight repeating keys, direct indexing took 1.025 ms, compared with 16.806 ms using owned string keys and 30.223 ms using borrowed string keys in the two hash map baselines. Dictionary construction was outside the timed comparison.
 
 ---
 
